@@ -1,75 +1,141 @@
-const { exec } = require('child_process')
-const path = require('path')
-const fs = require('fs')
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3')
-const mime = require('mime-types')
-// const Redis = require('ioredis')
 
+const { spawn } = require("child_process");
+const path = require("path");
+const fs = require("fs");
+const {
+    S3Client,
+    PutObjectCommand
+} = require("@aws-sdk/client-s3");
+const mime = require("mime-types");
 
-// const publisher = new Redis('')
+const PROJECT_ID = process.env.PROJECT_ID;
+const OUTPUT_DIR = process.env.OUTPUT_DIR || "dist";
 
+const requiredEnv = [
+    "CLOUDFLARE_ACCOUNT_ID",
+    "R2_ACCESS_KEY_ID",
+    "R2_SECRET_ACCESS_KEY",
+    "PROJECT_ID"
+];
+
+for (const key of requiredEnv) {
+    if (!process.env[key]) {
+        throw new Error(`Missing environment variable: ${key}`);
+    }
+}
 
 const s3Client = new S3Client({
     region: "auto",
     endpoint: `https://${process.env.CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com`,
     credentials: {
         accessKeyId: process.env.R2_ACCESS_KEY_ID,
-        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
-    },
+        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
+    }
 });
 
-const PROJECT_ID = process.env.PROJECT_ID
+function run(command, args, options = {}) {
+    return new Promise((resolve, reject) => {
+        console.log(`Running: ${command} ${args.join(" ")}`);
 
+        const child = spawn(command, args, {
+            ...options,
+            stdio: "inherit"
+        });
 
-// function publishLog(log) {
-//     publisher.publish(`logs:${PROJECT_ID}`, JSON.stringify({ log }))
-// }
+        child.on("error", reject);
 
-async function init() {
-    console.log('Executing script.js')
-    publishLog('Build Started...')
-    const outDirPath = path.join(__dirname, 'output')
-
-    const p = exec(`cd ${outDirPath} && npm install && npm run build`)
-
-    p.stdout.on('data', function (data) {
-        console.log(data.toString())
-        publishLog(data.toString())
-    })
-
-    p.stdout.on('error', function (data) {
-        console.log('Error', data.toString())
-        publishLog(`error: ${data.toString()}`)
-    })
-
-    p.on('close', async function () {
-        console.log('Build Complete')
-        publishLog(`Build Complete`)
-        const distFolderPath = path.join(__dirname, 'output', 'dist')
-        const distFolderContents = fs.readdirSync(distFolderPath, { recursive: true })
-
-        publishLog(`Starting to upload`)
-        for (const file of distFolderContents) {
-            const filePath = path.join(distFolderPath, file)
-            if (fs.lstatSync(filePath).isDirectory()) continue;
-
-            console.log('uploading', filePath)
-            publishLog(`uploading ${file}`)
-
-            const command = new PutObjectCommand({
-                Bucket: 'tiny-vercel',
-                Key: `__outputs/${PROJECT_ID}/${file}`,
-                Body: fs.createReadStream(filePath),
-                ContentType: mime.lookup(filePath)
-            })
-
-            await s3Client.send(command)
-            publishLog(`uploaded ${file}`)
-            console.log('uploaded', filePath)
-        }
-        publishLog(`Done`)
-        console.log('Done...')
-    })
+        child.on("close", (code) => {
+            if (code !== 0) {
+                reject(new Error(`${command} exited with code ${code}`));
+            } else {
+                resolve();
+            }
+        });
+    });
 }
 
-init()
+function getAllFiles(dir) {
+    let files = [];
+
+    for (const entry of fs.readdirSync(dir, {
+        withFileTypes: true
+    })) {
+        const fullPath = path.join(dir, entry.name);
+
+        if (entry.isDirectory()) {
+            files.push(...getAllFiles(fullPath));
+        } else if (entry.isFile()) {
+            files.push(fullPath);
+        }
+    }
+
+    return files;
+}
+
+async function uploadFiles(distPath) {
+    if (!fs.existsSync(distPath)) {
+        throw new Error(`Output directory not found: ${distPath}`);
+    }
+
+    const files = getAllFiles(distPath);
+
+    if (files.length === 0) {
+        throw new Error("Build output directory is empty");
+    }
+
+    console.log(`Uploading ${files.length} files to R2...`);
+
+    for (const filePath of files) {
+        const relativePath = path.relative(distPath, filePath)
+            .split(path.sep)
+            .join("/");
+
+        const key = `__outputs/${PROJECT_ID}/${relativePath}`;
+
+        console.log(`Uploading: ${relativePath}`);
+
+        await s3Client.send(new PutObjectCommand({
+            Bucket: "tiny-vercel",
+            Key: key,
+            Body: fs.createReadStream(filePath),
+            ContentType: mime.lookup(filePath) || "application/octet-stream"
+        }));
+
+        console.log(`Uploaded: ${relativePath}`);
+    }
+}
+
+async function main() {
+    console.log("================================");
+    console.log("Tiny Vercel Build Worker Started");
+    console.log("Project:", PROJECT_ID);
+    console.log("================================");
+
+    const projectPath = path.join(__dirname, "output");
+
+    // Install dependencies
+    await run("npm", ["install"], {
+        cwd: projectPath
+    });
+
+    // Build project
+    await run("npm", ["run", "build"], {
+        cwd: projectPath
+    });
+
+    console.log("Build completed successfully");
+
+    // Upload generated files
+    const distPath = path.resolve(projectPath, OUTPUT_DIR);
+
+    await uploadFiles(distPath);
+
+    console.log("================================");
+    console.log("Deployment completed successfully");
+    console.log("================================");
+}
+
+main().catch((error) => {
+    console.error("BUILD FAILED:", error);
+    process.exit(1);
+});
