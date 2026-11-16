@@ -1,23 +1,20 @@
-FROM ubuntu:resolute
 
+FROM node:20-bookworm-slim
 
 RUN apt-get update && \
-    apt-get upgrade -y && \
-    apt-get install -y curl git ca-certificates && \
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
-    apt-get install -y nodejs && \
-    apt-get clean && \
+    apt-get install -y --no-install-recommends git ca-certificates bash && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /home/app
 
-COPY main.sh main.sh
-COPY script.js script.js    
-COPY package*.json .
+COPY package*.json ./
 
-RUN npm install
+RUN npm ci
 
-RUN chmod +x main.sh
-RUN chmod +x script.js
+COPY main.sh script.js ./
 
-ENTRYPOINT [ "/home/app/main.sh" ]
+# Normalize Windows CRLF line endings
+RUN sed -i 's/\r$//' /home/app/main.sh && \
+    chmod 755 /home/app/main.sh
+
+ENTRYPOINT ["/bin/bash", "/home/app/main.sh"]

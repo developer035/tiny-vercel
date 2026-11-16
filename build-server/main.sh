@@ -1,28 +1,23 @@
 
 #!/bin/bash
+
+echo "=================================="
+echo "TINY VERCEL CONTAINER INITIALIZED"
+echo "=================================="
+
+echo "Node version:"
+node --version
+
+echo "NPM version:"
+npm --version
+
+echo "Working directory:"
+pwd
+
+echo "Environment validation:"
+echo "GIT_REPO_URL: ${GIT_REPO_URL:+SET}"
+echo "PROJECT_ID: ${PROJECT_ID:+SET}"
+
 set -Eeuo pipefail
 
-echo "Starting Tiny Vercel build worker..."
-
-if [[ -z "${GIT_REPO_URL:-}" ]]; then
-    echo "ERROR: GIT_REPO_URL is not configured"
-    exit 1
-fi
-
-if [[ -z "${PROJECT_ID:-}" ]]; then
-    echo "ERROR: PROJECT_ID is not configured"
-    exit 1
-fi
-
-echo "Cloning repository: $GIT_REPO_URL"
-
-rm -rf /home/app/output
-
-git clone --depth 1 \
-    --branch "${GIT_BRANCH:-main}" \
-    "$GIT_REPO_URL" \
-    /home/app/output
-
-echo "Repository cloned successfully"
-
-exec node /home/app/script.js
+echo "Starting repository clone..."
