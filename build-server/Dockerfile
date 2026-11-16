@@ -12,7 +12,7 @@ RUN apt-get update && \
 WORKDIR /home/app
 
 COPY main.sh main.sh
-COPY script.js script.js
+COPY script.js script.js    
 COPY package*.json .
 
 RUN npm install
