@@ -1,5 +1,5 @@
 
-FROM node:20-bookworm-slim
+FROM node
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends git ca-certificates bash && \
