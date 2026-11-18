@@ -88,7 +88,7 @@ app.post('/project', async (req, res) => {
                         name: 'builder-image',
                         env: [
                             {
-                                name: 'GIT_REPO_URL',
+                                name: 'GIT_REPOSITORY_URL',
                                 value: gitURL
                             },
                             {
