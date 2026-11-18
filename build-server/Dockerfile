@@ -8,15 +8,14 @@ RUN apt-get update && \
 
 # Set up FNM (Fast Node Manager) globally
 ENV FNM_DIR="/usr/local/fnm"
-ENV PATH="/usr/local/fnm:$PATH"
+ENV PATH="/usr/local/fnm/aliases/default/bin:$PATH"
 
-RUN curl -fsSL https://vercel.app | bash -s -- --install-dir "/usr/local/fnm" --skip-shell && \
+RUN curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir "/usr/local/fnm" --skip-shell && \
     eval "$(fnm env --shell bash)" && \
-    # Pre-cache common LTS versions so builds start instantly
     fnm install 18 && \
-    fnm install 20 && \
     fnm install 22 && \
-    fnm default 20
+    fnm install 26 && \
+    fnm default 26
 
 # Enable corepack (adds yarn and pnpm support out of the box)
 RUN eval "$(fnm env --shell bash)" && corepack enable
