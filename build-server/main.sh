@@ -1,29 +1,78 @@
-
 #!/bin/bash
+set -e
 
-echo "=================================="
-echo "TINY VERCEL CONTAINER INITIALIZED"
-echo "=================================="
+export FNM_DIR="/usr/local/fnm"
+export PATH="/usr/local/fnm:$PATH"
+eval "$(fnm env --shell bash)"
 
-echo "Node version:"
-node --version
+# 1. Clone the user's repo
+git clone --depth 1 "$GIT_REPOSITORY_URL" /home/app/output
+cd /home/app/output
 
-echo "NPM version:"
-npm --version
+# 2. Pick Node version: env var -> .nvmrc/.node-version -> default (20)
+if [ -n "$NODE_VERSION" ]; then
+    echo "Using platform-specified Node version: $NODE_VERSION"
+    fnm install "$NODE_VERSION"
+    fnm use "$NODE_VERSION"
+elif [ -f ".nvmrc" ] || [ -f ".node-version" ]; then
+    echo "Detected version file in repo..."
+    fnm install
+    fnm use
+else
+    echo "Using default Node 20"
+    fnm use 20
+fi
 
-echo "Working directory:"
-pwd
+# Node 25+ no longer bundles corepack
+if ! command -v corepack >/dev/null 2>&1; then
+    npm install -g corepack
+fi
+corepack enable
 
-echo "Environment validation:"
-echo "GIT_REPO_URL: ${GIT_REPO_URL:+SET}"
-echo "PROJECT_ID: ${PROJECT_ID:+SET}"
+# 3. Detect package manager
+if [ -f "pnpm-lock.yaml" ]; then
+    PM="pnpm"
+    DEFAULT_INSTALL="pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile"
+    DEFAULT_BUILD="pnpm run build"
+elif [ -f "yarn.lock" ]; then
+    PM="yarn"
+    DEFAULT_INSTALL="yarn install --frozen-lockfile || yarn install"
+    DEFAULT_BUILD="yarn build"
+elif [ -f "package-lock.json" ]; then
+    PM="npm"
+    DEFAULT_INSTALL="npm ci || npm install"
+    DEFAULT_BUILD="npm run build"
+else
+    PM="npm"
+    DEFAULT_INSTALL="npm install"
+    DEFAULT_BUILD="npm run build"
+fi
+echo "Detected $PM"
 
-set -Eeuo pipefail
+INSTALL_CMD="${INSTALL_COMMAND:-$DEFAULT_INSTALL}"
+BUILD_CMD="${BUILD_COMMAND:-$DEFAULT_BUILD}"
 
-echo "Starting repository clone..."
+# 4. Install and build (retry build for old webpack projects on newer Node)
+echo "Install: $INSTALL_CMD"
+bash -c "$INSTALL_CMD"
 
-export GIT_REPO_URL="$GIT_REPO_URL"
+echo "Build: $BUILD_CMD"
+if ! bash -c "$BUILD_CMD"; then
+    echo "Build failed, retrying with legacy OpenSSL provider..."
+    NODE_OPTIONS="--openssl-legacy-provider" bash -c "$BUILD_CMD"
+fi
 
-git clone "$GIT_REPO_URL" /home/app/output
+# 5. Detect output dir if not set
+if [ -z "$OUTPUT_DIR" ]; then
+    for d in dist build out public; do
+        if [ -d "$d" ]; then
+            export OUTPUT_DIR="$d"
+            break
+        fi
+    done
+fi
+echo "Using output directory: ${OUTPUT_DIR:-dist}"
 
-exec node script.js
+# 6. Upload
+cd /home/app
+node script.js

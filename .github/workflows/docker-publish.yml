@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - main
+      - node-version-manager
+      - realtime-logs
 
   workflow_dispatch:
 
