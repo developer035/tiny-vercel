@@ -11,7 +11,7 @@ git clone "$GIT_REPOSITORY_URL" /home/app/output
 cd /home/app/output
 
 # 2. Detect and switch Node version
-# Priority: Env var from your platform -> .nvmrc / .node-version -> default (20)
+# Priority: platform env var -> .nvmrc / .node-version -> default (24)
 if [ -n "$NODE_VERSION" ]; then
     echo "Using platform-specified Node version: $NODE_VERSION"
     fnm install "$NODE_VERSION"
@@ -21,14 +21,17 @@ elif [ -f ".nvmrc" ] || [ -f ".node-version" ]; then
     fnm install
     fnm use
 else
-    echo "Using default Node 26"
-    fnm use 26
+    echo "Using default Node 24"
+    fnm use 24
 fi
 
-# Enable corepack for the active Node version (unlocks yarn/pnpm)
+# Node 25+ no longer bundles corepack
+if ! command -v corepack >/dev/null 2>&1; then
+    npm install -g corepack
+fi
 corepack enable
 
-# 3. Auto-detect Package Manager & Build
+# 3. Auto-detect package manager & build
 if [ -f "pnpm-lock.yaml" ]; then
     echo "Detected pnpm"
     pnpm install --frozen-lockfile
@@ -43,6 +46,6 @@ else
     npm run build
 fi
 
-# 4. Run your upload script (S3 / R2 / Cloud Storage)
+# 4. Upload build output
 cd /home/app
 node script.js

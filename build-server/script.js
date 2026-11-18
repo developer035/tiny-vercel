@@ -1,4 +1,3 @@
-
 const { spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs");
@@ -111,19 +110,8 @@ async function main() {
     console.log("Project:", PROJECT_ID);
     console.log("================================");
 
+    // The repo is cloned and built by main.sh before this script runs
     const projectPath = path.join(__dirname, "output");
-
-    // Install dependencies
-    await run("npm", ["install"], {
-        cwd: projectPath
-    });
-
-    // Build project
-    await run("npm", ["run", "build"], {
-        cwd: projectPath
-    });
-
-    console.log("Build completed successfully");
 
     // Upload generated files
     const distPath = path.resolve(projectPath, OUTPUT_DIR);
