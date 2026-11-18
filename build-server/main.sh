@@ -21,8 +21,8 @@ elif [ -f ".nvmrc" ] || [ -f ".node-version" ]; then
     fnm install
     fnm use
 else
-    echo "Using default Node 20"
-    fnm use 20
+    echo "Using default Node 26"
+    fnm use 26
 fi
 
 # Enable corepack for the active Node version (unlocks yarn/pnpm)
