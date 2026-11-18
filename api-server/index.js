@@ -4,7 +4,6 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const Redis = require('ioredis');
-const crypto = require('crypto');
 const { JobsClient } = require('@google-cloud/run').v2;
 
 const app = express();
@@ -33,13 +32,63 @@ const ANSI = {
     red: "\x1b[31m"
 };
 
+// In-memory log history buffer for new subscribers and REST polling
+const MAX_LOG_HISTORY = 150;
+const logHistory = new Map();
+
+function storeLog(project, payload) {
+    if (!project) return;
+    if (!logHistory.has(project)) {
+        logHistory.set(project, []);
+    }
+    const history = logHistory.get(project);
+    history.push(payload);
+    if (history.length > MAX_LOG_HISTORY) {
+        history.shift();
+    }
+}
+
 function formatTerminalLog(payload) {
     const timeStr = payload.timestamp
         ? new Date(payload.timestamp).toLocaleTimeString("en-GB")
         : new Date().toLocaleTimeString("en-GB");
 
     const project = (payload.project || "unknown").slice(0, 18).padEnd(16);
+    const stage = (payload.stage || "build").toLowerCase();
     const level = (payload.level || "info").toLowerCase();
+
+    let stageBadge;
+    switch (stage) {
+        case "provisioning":
+            stageBadge = `${ANSI.magenta}[PROVISION]${ANSI.reset}`;
+            break;
+        case "container":
+            stageBadge = `${ANSI.blue}[CONTAINER]${ANSI.reset}`;
+            break;
+        case "source":
+            stageBadge = `${ANSI.cyan}[SOURCE]   ${ANSI.reset}`;
+            break;
+        case "environment":
+            stageBadge = `${ANSI.yellow}[ENV]      ${ANSI.reset}`;
+            break;
+        case "install":
+            stageBadge = `${ANSI.blue}[INSTALL]  ${ANSI.reset}`;
+            break;
+        case "build":
+            stageBadge = `${ANSI.magenta}[BUILD]    ${ANSI.reset}`;
+            break;
+        case "upload":
+            stageBadge = `${ANSI.yellow}[UPLOAD]   ${ANSI.reset}`;
+            break;
+        case "ready":
+            stageBadge = `${ANSI.green}[READY]    ${ANSI.reset}`;
+            break;
+        case "error":
+            stageBadge = `${ANSI.red}[ERROR]    ${ANSI.reset}`;
+            break;
+        default:
+            stageBadge = `${ANSI.gray}[${stage.toUpperCase().slice(0, 9).padEnd(9)}]${ANSI.reset}`;
+    }
 
     let levelBadge;
     let messageColor = ANSI.reset;
@@ -70,6 +119,14 @@ function formatTerminalLog(payload) {
             levelBadge = `${ANSI.magenta}⚡ CMD   ${ANSI.reset}`;
             messageColor = ANSI.magenta;
             break;
+        case "stdout":
+            levelBadge = `${ANSI.gray}• OUT   ${ANSI.reset}`;
+            messageColor = ANSI.reset;
+            break;
+        case "stderr":
+            levelBadge = `${ANSI.yellow}• ERR   ${ANSI.reset}`;
+            messageColor = ANSI.yellow;
+            break;
         default:
             levelBadge = `${ANSI.gray}• INFO  ${ANSI.reset}`;
             messageColor = ANSI.reset;
@@ -79,15 +136,35 @@ function formatTerminalLog(payload) {
     const projectCol = `${ANSI.cyan}${ANSI.bold}${project}${ANSI.reset}`;
     const sep = `${ANSI.gray}│${ANSI.reset}`;
 
-    return `${timeCol} ${sep} ${projectCol} ${sep} ${levelBadge} ${sep} ${messageColor}${payload.log}${ANSI.reset}`;
+    return `${timeCol} ${sep} ${projectCol} ${sep} ${stageBadge} ${sep} ${levelBadge} ${sep} ${messageColor}${payload.log}${ANSI.reset}`;
 }
 
-// Redis subscriber setup (Aiven Valkey / Redis)
+// Unified log ingestion handler (handles formatting, caching, and broadcasting)
+function handleIncomingLog(payload, channel) {
+    storeLog(payload.project, payload);
+
+    // 1. Terminal log
+    console.log(formatTerminalLog(payload));
+
+    // 2. Broadcast structured payload to Socket.io rooms
+    const payloadStr = JSON.stringify(payload);
+    if (channel) {
+        io.to(channel).emit('message', payloadStr);
+    }
+    if (payload.project) {
+        io.to(`logs:${payload.project}`).emit('message', payloadStr);
+        io.to(payload.project).emit('message', payloadStr);
+    }
+}
+
+// Redis Pub/Sub setup (Aiven Valkey / Redis)
 const REDIS_URL = process.env.REDIS_URL || "";
 let subscriber = null;
+let publisher = null;
 
 if (REDIS_URL) {
     subscriber = new Redis(REDIS_URL);
+    publisher = new Redis(REDIS_URL);
 
     subscriber.on('connect', () => {
         console.log(`${ANSI.green}✔${ANSI.reset} Connected to Redis/Valkey subscriber successfully`);
@@ -95,6 +172,14 @@ if (REDIS_URL) {
 
     subscriber.on('error', (err) => {
         console.error(`${ANSI.red}✖ Redis subscriber error:${ANSI.reset}`, err.message);
+    });
+
+    publisher.on('connect', () => {
+        console.log(`${ANSI.green}✔${ANSI.reset} Connected to Redis/Valkey publisher successfully`);
+    });
+
+    publisher.on('error', (err) => {
+        console.error(`${ANSI.red}✖ Redis publisher error:${ANSI.reset}`, err.message);
     });
 
     // Pattern subscribe to all project logs
@@ -117,6 +202,7 @@ if (REDIS_URL) {
                 log: parsed.log || message,
                 level: parsed.level || 'info',
                 stage: parsed.stage || 'build',
+                category: parsed.category || 'build',
                 timestamp: parsed.timestamp || new Date().toISOString(),
                 ...parsed
             };
@@ -126,20 +212,38 @@ if (REDIS_URL) {
                 log: message,
                 level: 'info',
                 stage: 'build',
+                category: 'build',
                 timestamp: new Date().toISOString()
             };
         }
 
-        // 1. Beautifully formatted terminal log
-        console.log(formatTerminalLog(payload));
-
-        // 2. Broadcast structured payload to Socket.io rooms (for frontend consumption)
-        const payloadStr = JSON.stringify(payload);
-        io.to(channel).emit('message', payloadStr);
-        io.to(payload.project).emit('message', payloadStr);
+        handleIncomingLog(payload, channel);
     });
 } else {
-    console.warn(`${ANSI.yellow}⚠ REDIS_URL not set. Redis subscriber is disabled.${ANSI.reset}`);
+    console.warn(`${ANSI.yellow}⚠ REDIS_URL not set. Redis subscriber/publisher is disabled.${ANSI.reset}`);
+}
+
+/**
+ * Publishes an API-generated log event (e.g. provisioning / dispatching).
+ */
+function publishApiLog(project, log, { stage = "provisioning", category = "container", level = "info", meta = {} } = {}) {
+    const payload = {
+        project,
+        log,
+        stage,
+        category,
+        level,
+        timestamp: new Date().toISOString(),
+        ...meta
+    };
+
+    if (publisher) {
+        // Publish to Redis; subscriber.on('pmessage') will ingest and broadcast
+        publisher.publish(`logs:${project}`, JSON.stringify(payload));
+    } else {
+        // Direct local dispatch when Redis is disabled
+        handleIncomingLog(payload, `logs:${project}`);
+    }
 }
 
 // Socket.io connection for frontend clients
@@ -148,30 +252,34 @@ io.on('connection', (socket) => {
 
     // Client requests to subscribe to logs for a specific project
     socket.on('subscribe', (channelOrSlug) => {
+        const projectSlug = channelOrSlug.replace('logs:', '');
         socket.join(channelOrSlug);
-        if (!channelOrSlug.startsWith('logs:')) {
-            socket.join(`logs:${channelOrSlug}`);
-        }
+        socket.join(projectSlug);
+        socket.join(`logs:${projectSlug}`);
+
         console.log(`${ANSI.gray}[WS]${ANSI.reset} Socket ${socket.id} subscribed to: ${channelOrSlug}`);
-        
-        socket.emit('message', JSON.stringify({
-            project: channelOrSlug.replace('logs:', ''),
-            log: `Connected to log stream for ${channelOrSlug}`,
-            level: 'info',
-            stage: 'init',
-            timestamp: new Date().toISOString()
-        }));
+
+        // Replay historical logs if available so initial provisioning logs are never lost
+        const history = logHistory.get(projectSlug);
+        if (history && history.length > 0) {
+            for (const item of history) {
+                socket.emit('message', JSON.stringify(item));
+            }
+        } else {
+            socket.emit('message', JSON.stringify({
+                project: projectSlug,
+                log: `Connected to log stream for ${projectSlug}`,
+                level: 'info',
+                stage: 'provisioning',
+                category: 'container',
+                timestamp: new Date().toISOString()
+            }));
+        }
     });
 
     socket.on('disconnect', () => {
         console.log(`${ANSI.gray}[WS]${ANSI.reset} Client disconnected: ${socket.id}`);
     });
-});
-
-const { GoogleAuth } = require('google-auth-library');
-
-const auth = new GoogleAuth({
-    scopes: ['https://www.googleapis.com/auth/cloud-platform']
 });
 
 // Cloud Run configuration
@@ -182,17 +290,28 @@ const config = {
 };
 
 // Cloud Run Jobs client
-const runClient = new JobsClient();
-
-// Validate configuration
-if (!config.PROJECT_ID) {
-    throw new Error('GCP_PROJECT_ID is missing from environment variables');
+let runClient = null;
+if (config.PROJECT_ID) {
+    runClient = new JobsClient();
+} else {
+    console.warn(`${ANSI.yellow}⚠ GCP_PROJECT_ID is missing from environment variables. Cloud Run Job dispatch will fail if triggered.${ANSI.reset}`);
 }
 
 // Health check
 app.get('/', (req, res) => {
     res.json({
         message: 'Tiny Vercel API is running'
+    });
+});
+
+// Retrieve log history for a project
+app.get('/project/:slug/logs', (req, res) => {
+    const { slug } = req.params;
+    const logs = logHistory.get(slug) || [];
+    res.json({
+        project: slug,
+        total: logs.length,
+        logs
     });
 });
 
@@ -236,8 +355,18 @@ app.post('/project', async (req, res) => {
             `/locations/${config.REGION}` +
             `/jobs/${config.JOB}`;
 
-        console.log(`${ANSI.cyan}ℹ Creating project:${ANSI.reset} ${projectSlug}`);
-        console.log(`${ANSI.gray}  Repository:${ANSI.reset} ${gitURL}`);
+        // 1. Log provisioning receipt
+        publishApiLog(projectSlug, `Received deployment request for repository: ${gitURL}`, {
+            stage: 'provisioning',
+            category: 'container',
+            level: 'info'
+        });
+
+        publishApiLog(projectSlug, `[Step 0/5] Initiating Google Cloud Run Job '${config.JOB}' in region '${config.REGION}'...`, {
+            stage: 'provisioning',
+            category: 'container',
+            level: 'step'
+        });
 
         // Prepare container environment variables
         const containerEnv = [
@@ -259,6 +388,10 @@ app.post('/project', async (req, res) => {
             });
         }
 
+        if (!runClient) {
+            throw new Error('GCP_PROJECT_ID is not configured on this server');
+        }
+
         // Trigger Cloud Run Job
         const [operation] = await runClient.runJob({
             name: jobName,
@@ -272,7 +405,12 @@ app.post('/project', async (req, res) => {
             }
         });
 
-        console.log(`${ANSI.green}✔ Build submitted for ${projectSlug}.${ANSI.reset} Live preview will be at: http://${projectSlug}.localhost:8000`);
+        // 2. Log successful dispatch
+        publishApiLog(projectSlug, `Cloud Run Job container dispatched. Waiting for build worker to boot...`, {
+            stage: 'provisioning',
+            category: 'container',
+            level: 'info'
+        });
 
         return res.status(202).json({
             status: 'queued',
@@ -286,9 +424,20 @@ app.post('/project', async (req, res) => {
     } catch (error) {
         console.error(`${ANSI.red}✖ Cloud Run error:${ANSI.reset}`, error);
 
+        if (req.body && req.body.gitURL) {
+            // If we have a project slug or error to emit
+            const fallbackSlug = "error";
+            publishApiLog(fallbackSlug, `Failed to dispatch build container: ${error.message}`, {
+                stage: 'error',
+                category: 'container',
+                level: 'error'
+            });
+        }
+
         return res.status(500).json({
             status: 'error',
-            message: 'Failed to start project build'
+            message: 'Failed to start project build',
+            error: error.message
         });
     }
 });
