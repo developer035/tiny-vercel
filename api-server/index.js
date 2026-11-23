@@ -1,13 +1,19 @@
 const { generateSlug } = require('random-word-slugs');
 require('dotenv').config();
 const express = require('express');
+const cors = require('cors');
+const { z } = require('zod');
+const { PrismaClient } = require('@prisma/client');
 const http = require('http');
 const { Server } = require('socket.io');
 const Redis = require('ioredis');
 const { JobsClient } = require('@google-cloud/run').v2;
 
 const app = express();
+const prisma = new PrismaClient();
+
 app.use(express.json());
+app.use(cors());
 
 // Set up HTTP Server and Socket.io
 const server = http.createServer(app);
@@ -304,31 +310,88 @@ app.get('/', (req, res) => {
     });
 });
 
-// Retrieve log history for a project
-app.get('/project/:slug/logs', (req, res) => {
-    const { slug } = req.params;
-    const logs = logHistory.get(slug) || [];
-    res.json({
-        project: slug,
-        total: logs.length,
-        logs
-    });
+// List all projects with their deployments
+app.get('/projects', async (req, res) => {
+    try {
+        const projects = await prisma.project.findMany({
+            orderBy: { createdAt: 'desc' },
+            include: {
+                Deployment: {
+                    orderBy: { createdAt: 'desc' },
+                    take: 5
+                }
+            }
+        });
+
+        return res.json({
+            status: 'success',
+            data: { projects }
+        });
+    } catch (error) {
+        console.error(`${ANSI.red}✖ Error fetching projects:${ANSI.reset}`, error);
+        return res.status(500).json({
+            status: 'error',
+            message: 'Failed to fetch projects',
+            error: error.message
+        });
+    }
 });
 
-// Create project and trigger build
-app.post('/project', async (req, res) => {
+// Retrieve single project by ID
+app.get('/project/:id', async (req, res) => {
     try {
-        const { gitURL } = req.body;
+        const { id } = req.params;
 
-        if (!gitURL) {
-            return res.status(400).json({
-                error: 'GitHub repository URL is required'
+        const project = await prisma.project.findUnique({
+            where: { id },
+            include: {
+                Deployment: {
+                    orderBy: { createdAt: 'desc' }
+                }
+            }
+        });
+
+        if (!project) {
+            return res.status(404).json({
+                status: 'error',
+                message: 'Project not found'
             });
         }
 
-        // Basic GitHub URL validation
-        let repositoryURL;
+        return res.json({
+            status: 'success',
+            data: { project }
+        });
+    } catch (error) {
+        console.error(`${ANSI.red}✖ Error fetching project:${ANSI.reset}`, error);
+        return res.status(500).json({
+            status: 'error',
+            message: 'Failed to fetch project',
+            error: error.message
+        });
+    }
+});
 
+// Create project in Postgres (Neon DB)
+app.post('/project', async (req, res) => {
+    try {
+        const schema = z.object({
+            name: z.string({ required_error: 'Project name is required' }).min(1, 'Project name is required'),
+            gitURL: z.string({ required_error: 'GitHub repository URL is required' }).url('Invalid repository URL')
+        });
+
+        const safeParseResult = schema.safeParse(req.body);
+
+        if (!safeParseResult.success) {
+            return res.status(400).json({
+                error: safeParseResult.error.errors
+            });
+        }
+
+        const { name, gitURL } = safeParseResult.data;
+
+        // Basic GitHub repository URL validation
+        let repositoryURL;
         try {
             repositoryURL = new URL(gitURL);
         } catch {
@@ -346,8 +409,67 @@ app.post('/project', async (req, res) => {
             });
         }
 
-        // Generate project slug
-        const projectSlug = generateSlug();
+        // Generate a unique project subdomain slug
+        const subDomain = generateSlug();
+
+        // Persist project in PostgreSQL via Neon DB
+        const project = await prisma.project.create({
+            data: {
+                name,
+                gitURL,
+                subDomain
+            }
+        });
+
+        return res.status(201).json({
+            status: 'success',
+            data: { project }
+        });
+    } catch (error) {
+        console.error(`${ANSI.red}✖ Database error creating project:${ANSI.reset}`, error);
+        return res.status(500).json({
+            status: 'error',
+            message: 'Failed to create project in database',
+            error: error.message
+        });
+    }
+});
+
+// Trigger a deployment for an existing project
+app.post('/deploy', async (req, res) => {
+    try {
+        const schema = z.object({
+            projectId: z.string({ required_error: 'projectId is required' }).min(1, 'projectId cannot be empty')
+        });
+
+        const safeParseResult = schema.safeParse(req.body);
+
+        if (!safeParseResult.success) {
+            return res.status(400).json({
+                error: safeParseResult.error.errors
+            });
+        }
+
+        const { projectId } = safeParseResult.data;
+
+        // Verify project exists in database
+        const project = await prisma.project.findUnique({
+            where: { id: projectId }
+        });
+
+        if (!project) {
+            return res.status(404).json({
+                error: 'Project not found'
+            });
+        }
+
+        // Create deployment record with QUEUED status
+        const deployment = await prisma.deployment.create({
+            data: {
+                project: { connect: { id: projectId } },
+                status: 'QUEUED'
+            }
+        });
 
         // Cloud Run Job resource name
         const jobName =
@@ -356,13 +478,13 @@ app.post('/project', async (req, res) => {
             `/jobs/${config.JOB}`;
 
         // 1. Log provisioning receipt
-        publishApiLog(projectSlug, `Received deployment request for repository: ${gitURL}`, {
+        publishApiLog(project.subDomain, `Received deployment request for project '${project.name}' (Deployment: ${deployment.id})`, {
             stage: 'provisioning',
             category: 'container',
             level: 'info'
         });
 
-        publishApiLog(projectSlug, `[Step 0/5] Initiating Google Cloud Run Job '${config.JOB}' in region '${config.REGION}'...`, {
+        publishApiLog(project.subDomain, `[Step 0/5] Initiating Google Cloud Run Job '${config.JOB}' in region '${config.REGION}'...`, {
             stage: 'provisioning',
             category: 'container',
             level: 'step'
@@ -372,11 +494,19 @@ app.post('/project', async (req, res) => {
         const containerEnv = [
             {
                 name: 'GIT_REPOSITORY_URL',
-                value: gitURL
+                value: project.gitURL
             },
             {
                 name: 'PROJECT_ID',
-                value: projectSlug
+                value: project.subDomain
+            },
+            {
+                name: 'PROJECT_UUID',
+                value: project.id
+            },
+            {
+                name: 'DEPLOYMENT_ID',
+                value: deployment.id
             }
         ];
 
@@ -406,7 +536,7 @@ app.post('/project', async (req, res) => {
         });
 
         // 2. Log successful dispatch
-        publishApiLog(projectSlug, `Cloud Run Job container dispatched. Waiting for build worker to boot...`, {
+        publishApiLog(project.subDomain, `Cloud Run Job container dispatched. Waiting for build worker to boot...`, {
             stage: 'provisioning',
             category: 'container',
             level: 'info'
@@ -414,33 +544,85 @@ app.post('/project', async (req, res) => {
 
         return res.status(202).json({
             status: 'queued',
-            message: 'Project build started successfully',
+            message: 'Deployment queued and container dispatched successfully',
             data: {
-                projectSlug,
-                url: `http://${projectSlug}.localhost:8000`
+                deploymentId: deployment.id,
+                projectId: project.id,
+                subDomain: project.subDomain,
+                url: `http://${project.subDomain}.localhost:8000`
             }
         });
 
     } catch (error) {
-        console.error(`${ANSI.red}✖ Cloud Run error:${ANSI.reset}`, error);
-
-        if (req.body && req.body.gitURL) {
-            // If we have a project slug or error to emit
-            const fallbackSlug = "error";
-            publishApiLog(fallbackSlug, `Failed to dispatch build container: ${error.message}`, {
-                stage: 'error',
-                category: 'container',
-                level: 'error'
-            });
-        }
+        console.error(`${ANSI.red}✖ Deployment error:${ANSI.reset}`, error);
 
         return res.status(500).json({
             status: 'error',
-            message: 'Failed to start project build',
+            message: 'Failed to dispatch deployment',
             error: error.message
         });
     }
 });
+
+// Retrieve single deployment by ID
+app.get('/deployment/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const deployment = await prisma.deployment.findUnique({
+            where: { id },
+            include: {
+                project: true
+            }
+        });
+
+        if (!deployment) {
+            return res.status(404).json({
+                status: 'error',
+                message: 'Deployment not found'
+            });
+        }
+
+        return res.json({
+            status: 'success',
+            data: { deployment }
+        });
+    } catch (error) {
+        console.error(`${ANSI.red}✖ Error fetching deployment:${ANSI.reset}`, error);
+        return res.status(500).json({
+            status: 'error',
+            message: 'Failed to fetch deployment',
+            error: error.message
+        });
+    }
+});
+
+// Retrieve log history for a project
+app.get('/project/:slug/logs', (req, res) => {
+    const { slug } = req.params;
+    const logs = logHistory.get(slug) || [];
+    res.json({
+        project: slug,
+        total: logs.length,
+        logs
+    });
+});
+
+// Graceful shutdown handling
+const gracefulShutdown = async (signal) => {
+    console.log(`\n${ANSI.yellow}Received ${signal}. Shutting down API server gracefully...${ANSI.reset}`);
+    try {
+        await prisma.$disconnect();
+        if (subscriber) await subscriber.quit();
+        if (publisher) await publisher.quit();
+    } catch (err) {
+        console.error('Error during shutdown cleanup:', err);
+    }
+    process.exit(0);
+};
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 // Start server
 const PORT = process.env.PORT || 9000;
