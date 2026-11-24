@@ -28,7 +28,10 @@ WORKDIR /home/app
 COPY package*.json ./
 RUN npm ci
 
-COPY main.sh script.js ./
+COPY main.sh script.js kafka.pem* ./
+
+# Default location of Aiven CA certificate inside the container
+ENV KAFKA_CA_PATH="/home/app/kafka.pem"
 
 # Normalize Windows CRLF line endings
 RUN sed -i 's/\r$//' /home/app/main.sh && \

@@ -7,21 +7,55 @@ const {
     PutObjectCommand
 } = require("@aws-sdk/client-s3");
 const mime = require("mime-types");
-const Redis = require("ioredis");
+const { Kafka } = require("kafkajs");
 
 const workerStartTime = Date.now();
 const PROJECT_ID = process.env.PROJECT_ID;
+const DEPLOYMENT_ID = process.env.DEPLOYMENT_ID || "";
 const GIT_REPOSITORY_URL = process.env.GIT_REPOSITORY_URL;
-const REDIS_URL = process.env.REDIS_URL || "";
-const CHANNEL_NAME = process.env.REDIS_CHANNEL || (PROJECT_ID ? `logs:${PROJECT_ID}` : "logs:general");
 
-// Initialize Redis publisher if REDIS_URL is provided
-let publisher = null;
-if (REDIS_URL) {
-    publisher = new Redis(REDIS_URL);
-    publisher.on("error", (err) => {
-        console.error("Redis publisher error:", err.message);
-    });
+// Aiven Apache Kafka configuration from environment variables
+const KAFKA_BROKER = process.env.KAFKA_BROKER;
+const KAFKA_USERNAME = process.env.KAFKA_USERNAME;
+const KAFKA_PASSWORD = process.env.KAFKA_PASSWORD;
+const KAFKA_CA_PATH = process.env.KAFKA_CA_PATH
+const TOPIC_NAME = process.env.KAFKA_TOPIC || "container-logs";
+
+// Silence KafkaJS default partitioner warning
+process.env.KAFKAJS_NO_PARTITIONER_WARNING = "1";
+
+// Initialize Kafka client and producer
+let kafka = null;
+let producer = null;
+
+if (KAFKA_BROKER) {
+    const brokers = KAFKA_BROKER.split(",").map(b => b.trim().replace(/^kafka:\/\//, ""));
+
+    let sslConfig = true;
+    if (KAFKA_CA_PATH) {
+        if (fs.existsSync(KAFKA_CA_PATH)) {
+            sslConfig = { ca: [fs.readFileSync(path.resolve(KAFKA_CA_PATH), "utf-8")] };
+        } else if (KAFKA_CA_PATH.includes("BEGIN CERTIFICATE")) {
+            sslConfig = { ca: [KAFKA_CA_PATH] };
+        }
+    }
+
+    const kafkaConfig = {
+        clientId: `build-server-${DEPLOYMENT_ID || PROJECT_ID || "worker"}`,
+        brokers,
+        ssl: sslConfig
+    };
+
+    if (KAFKA_USERNAME && KAFKA_PASSWORD) {
+        kafkaConfig.sasl = {
+            mechanism: process.env.KAFKA_SASL_MECHANISM || "plain",
+            username: KAFKA_USERNAME,
+            password: KAFKA_PASSWORD
+        };
+    }
+
+    kafka = new Kafka(kafkaConfig);
+    producer = kafka.producer();
 }
 
 function formatBytes(bytes) {
@@ -36,11 +70,13 @@ function publishLog(log, { stage = "build", category = "build", level = "info", 
     const logStr = typeof log === "string" ? log : JSON.stringify(log);
     console.log(logStr);
 
-    if (!publisher || !PROJECT_ID) return;
+    if (!producer || !PROJECT_ID) return;
 
     try {
         const payload = JSON.stringify({
+            PROJECT_ID,
             project: PROJECT_ID,
+            ...(DEPLOYMENT_ID ? { DEPLOYMENT_ID, deployment_id: DEPLOYMENT_ID } : {}),
             stage,
             category,
             level,
@@ -49,11 +85,17 @@ function publishLog(log, { stage = "build", category = "build", level = "info", 
             ...meta
         });
 
-        publisher.publish(CHANNEL_NAME, payload);
-
-        if (PROJECT_ID && CHANNEL_NAME !== PROJECT_ID) {
-            publisher.publish(PROJECT_ID, payload);
-        }
+        return producer.send({
+            topic: TOPIC_NAME,
+            messages: [
+                {
+                    key: `message-${Date.now()}`,
+                    value: payload
+                }
+            ]
+        }).catch((err) => {
+            console.error("Failed to publish log to Kafka:", err.message);
+        });
     } catch (err) {
         console.error("Failed to publish log:", err.message);
     }
@@ -66,11 +108,11 @@ const handleShutdown = async (signal) => {
         category: "container",
         level: "warn"
     });
-    if (publisher) {
+    if (producer) {
         try {
-            await publisher.quit();
-        } catch {
-            publisher.disconnect();
+            await producer.disconnect();
+        } catch (err) {
+            console.error("Error disconnecting Kafka producer:", err.message);
         }
     }
     process.exit(143);
@@ -80,7 +122,7 @@ process.on("SIGINT", () => handleShutdown("SIGINT"));
 
 /**
  * Spawns a shell command in bash, ensuring FNM environment is loaded,
- * and streams stdout & stderr line-by-line to Redis in real time.
+ * and streams stdout & stderr line-by-line to Kafka in real time.
  */
 function runStreamingCommand(command, { cwd = "/home/app", stage = "build", category = "build", extraEnv = {}, nodeVersion = null } = {}) {
     return new Promise((resolve, reject) => {
@@ -250,7 +292,17 @@ async function uploadFiles(s3Client, distPath) {
     return { totalFiles: files.length, totalBytes };
 }
 
-async function main() {
+async function init() {
+    // Connect to Kafka producer
+    if (producer) {
+        try {
+            await producer.connect();
+            console.log("✔ Connected to Kafka producer successfully");
+        } catch (err) {
+            console.error("Failed to connect to Kafka producer:", err.message);
+        }
+    }
+
     // Validate required environment variables
     const requiredEnv = [
         "CLOUDFLARE_ACCOUNT_ID",
@@ -554,17 +606,17 @@ async function main() {
     publishLog(`│  Artifacts  : ${(totalFiles + " files (" + formatBytes(totalBytes) + ")").padEnd(44)} │`, { level: "ready", stage: "ready", category: "deploy" });
     publishLog("└────────────────────────────────────────────────────────────┘", { level: "ready", stage: "ready", category: "deploy" });
 
-    // Clean up Redis connection
-    if (publisher) {
+    // Clean up Kafka producer connection
+    if (producer) {
         try {
-            await publisher.quit();
-        } catch {
-            publisher.disconnect();
+            await producer.disconnect();
+        } catch (err) {
+            console.error("Error disconnecting Kafka producer:", err.message);
         }
     }
 }
 
-main().catch(async (error) => {
+init().catch(async (error) => {
     const errorMsg = error.message || String(error);
     console.error("BUILD WORKER FATAL ERROR:", error);
 
@@ -574,11 +626,11 @@ main().catch(async (error) => {
         publishLog(`│  Error : ${errorMsg.slice(0, 48).padEnd(48)} │`, { level: "error", stage: "error", category: "error" });
         publishLog("└────────────────────────────────────────────────────────────┘", { level: "error", stage: "error", category: "error" });
 
-        if (publisher) {
-            await publisher.quit();
+        if (producer) {
+            await producer.disconnect();
         }
     } catch {
-        if (publisher) publisher.disconnect();
+        // ignore
     }
 
     process.exit(1);

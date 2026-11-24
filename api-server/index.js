@@ -6,8 +6,12 @@ const { z } = require('zod');
 const { PrismaClient } = require('@prisma/client');
 const http = require('http');
 const { Server } = require('socket.io');
-const Redis = require('ioredis');
 const { JobsClient } = require('@google-cloud/run').v2;
+const { createClient } = require('@clickhouse/client');
+const { Kafka } = require('kafkajs');
+const { v4: uuidv4 } = require('uuid');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const prisma = new PrismaClient();
@@ -163,70 +167,162 @@ function handleIncomingLog(payload, channel) {
     }
 }
 
-// Redis Pub/Sub setup (Aiven Valkey / Redis)
-const REDIS_URL = process.env.REDIS_URL || "";
-let subscriber = null;
-let publisher = null;
+// =========================================================================
+// Aiven ClickHouse client
+// =========================================================================
+const clickhouseHost = process.env.CLICKHOUSE_HOST || '';
+let clickhouseClient = null;
 
-if (REDIS_URL) {
-    subscriber = new Redis(REDIS_URL);
-    publisher = new Redis(REDIS_URL);
+if (clickhouseHost) {
+    const formattedUrl = clickhouseHost.startsWith('http://') || clickhouseHost.startsWith('https://')
+        ? clickhouseHost
+        : `https://${clickhouseHost}:${process.env.CLICKHOUSE_PORT || 8443}`;
 
-    subscriber.on('connect', () => {
-        console.log(`${ANSI.green}✔${ANSI.reset} Connected to Redis/Valkey subscriber successfully`);
+    clickhouseClient = createClient({
+        url: formattedUrl,
+        database: process.env.CLICKHOUSE_DATABASE || 'default',
+        username: process.env.CLICKHOUSE_USER || 'avnadmin',
+        password: process.env.CLICKHOUSE_PASSWORD || ''
     });
 
-    subscriber.on('error', (err) => {
-        console.error(`${ANSI.red}✖ Redis subscriber error:${ANSI.reset}`, err.message);
-    });
-
-    publisher.on('connect', () => {
-        console.log(`${ANSI.green}✔${ANSI.reset} Connected to Redis/Valkey publisher successfully`);
-    });
-
-    publisher.on('error', (err) => {
-        console.error(`${ANSI.red}✖ Redis publisher error:${ANSI.reset}`, err.message);
-    });
-
-    // Pattern subscribe to all project logs
-    subscriber.psubscribe('logs:*', (err, count) => {
-        if (err) {
-            console.error(`${ANSI.red}✖ Failed to subscribe to logs pattern:${ANSI.reset}`, err.message);
-        } else {
-            console.log(`${ANSI.cyan}ℹ Subscribed to Redis logs pattern:${ANSI.reset} logs:* (active: ${count})`);
-        }
-    });
-
-    // Handle incoming messages on matching pattern
-    subscriber.on('pmessage', (pattern, channel, message) => {
-        let payload;
-
-        try {
-            const parsed = JSON.parse(message);
-            payload = {
-                project: parsed.project || channel.replace('logs:', ''),
-                log: parsed.log || message,
-                level: parsed.level || 'info',
-                stage: parsed.stage || 'build',
-                category: parsed.category || 'build',
-                timestamp: parsed.timestamp || new Date().toISOString(),
-                ...parsed
-            };
-        } catch {
-            payload = {
-                project: channel.replace('logs:', ''),
-                log: message,
-                level: 'info',
-                stage: 'build',
-                category: 'build',
-                timestamp: new Date().toISOString()
-            };
-        }
-
-        handleIncomingLog(payload, channel);
-    });
+    console.log(`${ANSI.green}✔${ANSI.reset} ClickHouse client initialized (${formattedUrl})`);
 } else {
-    console.warn(`${ANSI.yellow}⚠ REDIS_URL not set. Redis subscriber/publisher is disabled.${ANSI.reset}`);
+    console.warn(`${ANSI.yellow}⚠ CLICKHOUSE_HOST not set. ClickHouse client is disabled.${ANSI.reset}`);
+}
+
+// =========================================================================
+// Aiven Kafka consumer (api-server side)
+// Subscribes to 'container-logs', inserts every log row into ClickHouse
+// =========================================================================
+const KAFKA_BROKER = process.env.KAFKA_BROKER || '';
+const KAFKA_USERNAME = process.env.KAFKA_USERNAME || '';
+const KAFKA_PASSWORD = process.env.KAFKA_PASSWORD || '';
+const KAFKA_CA_PATH = process.env.KAFKA_CA_PATH || '';
+const KAFKA_TOPIC = process.env.KAFKA_TOPIC || 'container-logs';
+
+// Silence KafkaJS default partitioner warning (same as build-server)
+process.env.KAFKAJS_NO_PARTITIONER_WARNING = '1';
+
+let kafkaConsumer = null;
+
+if (KAFKA_BROKER) {
+    const brokers = KAFKA_BROKER.split(',').map(b => b.trim().replace(/^kafka:\/\//, ''));
+
+    let sslConfig = true;
+    if (KAFKA_CA_PATH) {
+        if (fs.existsSync(path.resolve(KAFKA_CA_PATH))) {
+            sslConfig = { ca: [fs.readFileSync(path.resolve(KAFKA_CA_PATH), 'utf-8')] };
+        } else if (KAFKA_CA_PATH.includes('BEGIN CERTIFICATE')) {
+            sslConfig = { ca: [KAFKA_CA_PATH] };
+        }
+    }
+
+    const kafkaInstance = new Kafka({
+        clientId: 'api-server-log-consumer',
+        brokers,
+        ssl: sslConfig,
+        ...(KAFKA_USERNAME && KAFKA_PASSWORD ? {
+            sasl: {
+                mechanism: process.env.KAFKA_SASL_MECHANISM || 'plain',
+                username: KAFKA_USERNAME,
+                password: KAFKA_PASSWORD
+            }
+        } : {})
+    });
+
+    kafkaConsumer = kafkaInstance.consumer({ groupId: 'api-server-logs-consumer' });
+}
+
+async function initKafkaConsumer() {
+    if (!kafkaConsumer) {
+        console.warn(`${ANSI.yellow}⚠ KAFKA_BROKER not set. Kafka consumer is disabled.${ANSI.reset}`);
+        return;
+    }
+
+    try {
+        await kafkaConsumer.connect();
+        console.log(`${ANSI.green}✔${ANSI.reset} Kafka consumer connected`);
+
+        await kafkaConsumer.subscribe({ topics: [KAFKA_TOPIC], fromBeginning: true });
+        console.log(`${ANSI.cyan}ℹ${ANSI.reset} Kafka consumer subscribed to topic: ${KAFKA_TOPIC}`);
+
+        await kafkaConsumer.run({
+            eachBatch: async ({ batch, heartbeat, commitOffsetsIfNecessary, resolveOffset }) => {
+                const messages = batch.messages;
+                console.log(`${ANSI.gray}[Kafka]${ANSI.reset} Received ${messages.length} messages`);
+
+                for (const message of messages) {
+                    if (!message.value) continue;
+
+                    let parsed;
+                    try {
+                        parsed = JSON.parse(message.value.toString());
+                    } catch {
+                        console.warn(`${ANSI.yellow}⚠ Skipping non-JSON Kafka message${ANSI.reset}`);
+                        resolveOffset(message.offset);
+                        continue;
+                    }
+
+                    const {
+                        PROJECT_ID, project,
+                        DEPLOYMENT_ID, deployment_id,
+                        stage = 'build',
+                        category = 'build',
+                        level = 'info',
+                        log = '',
+                        timestamp,
+                        ...rest
+                    } = parsed;
+
+                    const resolvedDeploymentId = DEPLOYMENT_ID || deployment_id || '';
+                    const resolvedProjectId = PROJECT_ID || project || '';
+                    const ts = timestamp || new Date().toISOString();
+                    const rawMeta = Object.keys(rest).length ? JSON.stringify(rest) : '{}';
+
+                    if (clickhouseClient) {
+                        try {
+                            await clickhouseClient.insert({
+                                table: 'deployment_logs',
+                                values: [{
+                                    event_id: uuidv4(),
+                                    deployment_id: resolvedDeploymentId,
+                                    project_id: resolvedProjectId,
+                                    stage,
+                                    category,
+                                    level,
+                                    log: typeof log === 'string' ? log : JSON.stringify(log),
+                                    timestamp: ts,
+                                    raw_meta: rawMeta
+                                }],
+                                format: 'JSONEachRow'
+                            });
+                        } catch (err) {
+                            console.error(`${ANSI.red}✖ ClickHouse insert error:${ANSI.reset}`, err.message);
+                        }
+                    }
+
+                    // Forward real-time log to console and Socket.io clients (replacing Redis pub/sub)
+                    const logPayload = {
+                        project: resolvedProjectId,
+                        deployment_id: resolvedDeploymentId,
+                        stage,
+                        category,
+                        level,
+                        log: typeof log === 'string' ? log : JSON.stringify(log),
+                        timestamp: ts,
+                        ...rest
+                    };
+                    handleIncomingLog(logPayload, `logs:${resolvedProjectId}`);
+
+                    resolveOffset(message.offset);
+                    await commitOffsetsIfNecessary(message.offset);
+                    await heartbeat();
+                }
+            }
+        });
+    } catch (err) {
+        console.error(`${ANSI.red}✖ Failed to start Kafka consumer:${ANSI.reset}`, err.message);
+    }
 }
 
 /**
@@ -243,13 +339,7 @@ function publishApiLog(project, log, { stage = "provisioning", category = "conta
         ...meta
     };
 
-    if (publisher) {
-        // Publish to Redis; subscriber.on('pmessage') will ingest and broadcast
-        publisher.publish(`logs:${project}`, JSON.stringify(payload));
-    } else {
-        // Direct local dispatch when Redis is disabled
-        handleIncomingLog(payload, `logs:${project}`);
-    }
+    handleIncomingLog(payload, `logs:${project}`);
 }
 
 // Socket.io connection for frontend clients
@@ -510,12 +600,17 @@ app.post('/deploy', async (req, res) => {
             }
         ];
 
-        // Pass REDIS_URL to Cloud Run Job container if configured
-        if (REDIS_URL) {
-            containerEnv.push({
-                name: 'REDIS_URL',
-                value: REDIS_URL
-            });
+        // Forward Kafka configuration to Cloud Run Job container if configured
+        if (KAFKA_BROKER) {
+            containerEnv.push(
+                { name: 'KAFKA_BROKER', value: KAFKA_BROKER },
+                { name: 'KAFKA_USERNAME', value: KAFKA_USERNAME },
+                { name: 'KAFKA_PASSWORD', value: KAFKA_PASSWORD },
+                { name: 'KAFKA_TOPIC', value: KAFKA_TOPIC }
+            );
+            if (KAFKA_CA_PATH) {
+                containerEnv.push({ name: 'KAFKA_CA_PATH', value: KAFKA_CA_PATH });
+            }
         }
 
         if (!runClient) {
@@ -608,13 +703,56 @@ app.get('/project/:slug/logs', (req, res) => {
     });
 });
 
+// Query deployment logs from ClickHouse data warehouse
+app.get('/logs/:id', async (req, res) => {
+    try {
+        const id = req.params.id;
+        const limit = Number(req.query.limit) || 1000;
+
+        if (!clickhouseClient) {
+            return res.status(503).json({
+                status: 'error',
+                message: 'ClickHouse client is not configured on this server'
+            });
+        }
+
+        const resultSet = await clickhouseClient.query({
+            query: `
+                SELECT event_id, deployment_id, project_id, stage, category, level, log, timestamp
+                FROM deployment_logs
+                WHERE deployment_id = {deployment_id: String}
+                ORDER BY timestamp ASC
+                LIMIT {limit: UInt32}
+            `,
+            query_params: { deployment_id: id, limit },
+            format: 'JSONEachRow'
+        });
+
+        const logs = await resultSet.json();
+
+        return res.json({
+            status: 'success',
+            deploymentId: id,
+            total: logs.length,
+            logs
+        });
+    } catch (error) {
+        console.error(`${ANSI.red}✖ ClickHouse query error:${ANSI.reset}`, error.message);
+        return res.status(500).json({
+            status: 'error',
+            message: 'Failed to fetch logs from ClickHouse',
+            error: error.message
+        });
+    }
+});
+
 // Graceful shutdown handling
 const gracefulShutdown = async (signal) => {
     console.log(`\n${ANSI.yellow}Received ${signal}. Shutting down API server gracefully...${ANSI.reset}`);
     try {
         await prisma.$disconnect();
-        if (subscriber) await subscriber.quit();
-        if (publisher) await publisher.quit();
+        if (kafkaConsumer) await kafkaConsumer.disconnect();
+        if (clickhouseClient) await clickhouseClient.close();
     } catch (err) {
         console.error('Error during shutdown cleanup:', err);
     }
@@ -623,6 +761,11 @@ const gracefulShutdown = async (signal) => {
 
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+
+// Boot the Kafka consumer (non-blocking)
+initKafkaConsumer().catch(err => {
+    console.error(`${ANSI.red}✖ Kafka consumer failed to start:${ANSI.reset}`, err.message);
+});
 
 // Start server
 const PORT = process.env.PORT || 9000;
