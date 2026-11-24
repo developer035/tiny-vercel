@@ -197,8 +197,63 @@ if (clickhouseHost) {
 const KAFKA_BROKER = process.env.KAFKA_BROKER || '';
 const KAFKA_USERNAME = process.env.KAFKA_USERNAME || '';
 const KAFKA_PASSWORD = process.env.KAFKA_PASSWORD || '';
+const KAFKA_CA_CERT = process.env.KAFKA_CA_CERT || process.env.KAFKA_CA_CONTENT || process.env.KAFKA_CA_PEM || '';
 const KAFKA_CA_PATH = process.env.KAFKA_CA_PATH || '';
 const KAFKA_TOPIC = process.env.KAFKA_TOPIC || 'container-logs';
+
+// Helper to resolve CA certificate content from env variable or file path
+function resolveCaCertificateContent(input) {
+    const raw = input || KAFKA_CA_CERT || KAFKA_CA_PATH;
+    if (!raw) {
+        const defaultPaths = [
+            path.resolve(__dirname, 'kafca_ca.pem'),
+            path.resolve(__dirname, 'Kafka_Ca.pem'),
+            path.resolve(__dirname, 'kafka.pem'),
+            path.resolve(__dirname, '..', 'build-server', 'kafca_ca.pem'),
+            path.resolve(__dirname, '..', 'build-server', 'Kafka_Ca.pem'),
+            path.resolve(__dirname, '..', 'build-server', 'kafka.pem')
+        ];
+        const found = defaultPaths.find(p => fs.existsSync(p));
+        if (found) {
+            try {
+                return fs.readFileSync(found, 'utf-8');
+            } catch {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    let trimmed = raw.trim();
+    if (trimmed.includes('\\n')) {
+        trimmed = trimmed.replace(/\\n/g, '\n');
+    }
+
+    if (trimmed.includes('BEGIN CERTIFICATE')) {
+        return trimmed;
+    }
+
+    const candidatePaths = [
+        path.resolve(trimmed),
+        path.resolve(__dirname, trimmed),
+        path.resolve(__dirname, path.basename(trimmed)),
+        path.resolve(__dirname, 'kafca_ca.pem'),
+        path.resolve(__dirname, 'Kafka_Ca.pem'),
+        path.resolve(__dirname, 'kafka.pem'),
+        path.resolve(__dirname, '..', 'build-server', 'kafca_ca.pem'),
+        path.resolve(__dirname, '..', 'build-server', 'Kafka_Ca.pem'),
+        path.resolve(__dirname, '..', 'build-server', 'kafka.pem')
+    ];
+    const found = candidatePaths.find(p => fs.existsSync(p));
+    if (found) {
+        try {
+            return fs.readFileSync(found, 'utf-8');
+        } catch {
+            return null;
+        }
+    }
+    return null;
+}
 
 // Silence KafkaJS default partitioner warning (same as build-server)
 process.env.KAFKAJS_NO_PARTITIONER_WARNING = '1';
@@ -209,12 +264,9 @@ if (KAFKA_BROKER) {
     const brokers = KAFKA_BROKER.split(',').map(b => b.trim().replace(/^kafka:\/\//, ''));
 
     let sslConfig = true;
-    if (KAFKA_CA_PATH) {
-        if (fs.existsSync(path.resolve(KAFKA_CA_PATH))) {
-            sslConfig = { ca: [fs.readFileSync(path.resolve(KAFKA_CA_PATH), 'utf-8')] };
-        } else if (KAFKA_CA_PATH.includes('BEGIN CERTIFICATE')) {
-            sslConfig = { ca: [KAFKA_CA_PATH] };
-        }
+    const caCertContent = resolveCaCertificateContent(KAFKA_CA_CERT || KAFKA_CA_PATH);
+    if (caCertContent) {
+        sslConfig = { ca: [caCertContent] };
     }
 
     const kafkaInstance = new Kafka({
@@ -608,8 +660,17 @@ app.post('/deploy', async (req, res) => {
                 { name: 'KAFKA_PASSWORD', value: KAFKA_PASSWORD },
                 { name: 'KAFKA_TOPIC', value: KAFKA_TOPIC }
             );
-            if (KAFKA_CA_PATH) {
-                containerEnv.push({ name: 'KAFKA_CA_PATH', value: KAFKA_CA_PATH });
+            if (process.env.KAFKA_SASL_MECHANISM) {
+                containerEnv.push({ name: 'KAFKA_SASL_MECHANISM', value: process.env.KAFKA_SASL_MECHANISM });
+            }
+
+            // Resolve CA cert content to pass directly so Cloud Run receives PEM contents dynamically
+            const caContent = resolveCaCertificateContent(KAFKA_CA_CERT || KAFKA_CA_PATH);
+            if (caContent) {
+                containerEnv.push(
+                    { name: 'KAFKA_CA_CERT', value: caContent },
+                    { name: 'KAFKA_CA_PATH', value: caContent }
+                );
             }
         }
 

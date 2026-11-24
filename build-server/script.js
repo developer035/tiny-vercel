@@ -18,8 +18,61 @@ const GIT_REPOSITORY_URL = process.env.GIT_REPOSITORY_URL;
 const KAFKA_BROKER = process.env.KAFKA_BROKER;
 const KAFKA_USERNAME = process.env.KAFKA_USERNAME;
 const KAFKA_PASSWORD = process.env.KAFKA_PASSWORD;
-const KAFKA_CA_PATH = process.env.KAFKA_CA_PATH
+const KAFKA_CA_CERT = process.env.KAFKA_CA_CERT || process.env.KAFKA_CA_CONTENT || process.env.KAFKA_CA_PEM;
+const KAFKA_CA_PATH = process.env.KAFKA_CA_PATH;
 const TOPIC_NAME = process.env.KAFKA_TOPIC || "container-logs";
+
+// Helper to resolve CA certificate content from env variable or file path
+function resolveCaCertificateContent(input) {
+    const raw = input || KAFKA_CA_CERT || KAFKA_CA_PATH;
+    if (!raw) {
+        const defaultPaths = [
+            "/home/app/kafka.pem",
+            "/home/app/kafca_ca.pem",
+            "/home/app/Kafka_Ca.pem",
+            path.resolve(__dirname, "kafka.pem"),
+            path.resolve(__dirname, "kafca_ca.pem"),
+            path.resolve(__dirname, "Kafka_Ca.pem")
+        ];
+        const found = defaultPaths.find(p => fs.existsSync(p));
+        if (found) {
+            try {
+                return fs.readFileSync(found, "utf-8");
+            } catch {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    let trimmed = raw.trim();
+    if (trimmed.includes("\\n")) {
+        trimmed = trimmed.replace(/\\n/g, "\n");
+    }
+
+    if (trimmed.includes("BEGIN CERTIFICATE")) {
+        return trimmed;
+    }
+
+    const candidatePaths = [
+        trimmed,
+        path.resolve(trimmed),
+        path.resolve(__dirname, trimmed),
+        path.resolve(__dirname, path.basename(trimmed)),
+        "/home/app/kafka.pem",
+        "/home/app/kafca_ca.pem",
+        "/home/app/Kafka_Ca.pem"
+    ];
+    const found = candidatePaths.find(p => fs.existsSync(p));
+    if (found) {
+        try {
+            return fs.readFileSync(found, "utf-8");
+        } catch {
+            return null;
+        }
+    }
+    return null;
+}
 
 // Silence KafkaJS default partitioner warning
 process.env.KAFKAJS_NO_PARTITIONER_WARNING = "1";
@@ -32,12 +85,9 @@ if (KAFKA_BROKER) {
     const brokers = KAFKA_BROKER.split(",").map(b => b.trim().replace(/^kafka:\/\//, ""));
 
     let sslConfig = true;
-    if (KAFKA_CA_PATH) {
-        if (fs.existsSync(KAFKA_CA_PATH)) {
-            sslConfig = { ca: [fs.readFileSync(path.resolve(KAFKA_CA_PATH), "utf-8")] };
-        } else if (KAFKA_CA_PATH.includes("BEGIN CERTIFICATE")) {
-            sslConfig = { ca: [KAFKA_CA_PATH] };
-        }
+    const caContent = resolveCaCertificateContent();
+    if (caContent) {
+        sslConfig = { ca: [caContent] };
     }
 
     const kafkaConfig = {
@@ -300,6 +350,7 @@ async function init() {
             console.log("✔ Connected to Kafka producer successfully");
         } catch (err) {
             console.error("Failed to connect to Kafka producer:", err.message);
+            producer = null;
         }
     }
 
