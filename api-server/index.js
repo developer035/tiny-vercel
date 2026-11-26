@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const { z } = require('zod');
 const { PrismaClient } = require('@prisma/client');
+const { clerkMiddleware, getAuth, verifyToken } = require('@clerk/express');
 const http = require('http');
 const { Server } = require('socket.io');
 const { JobsClient } = require('@google-cloud/run').v2;
@@ -14,10 +15,71 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
-const prisma = new PrismaClient();
+
+// Prisma client with extended timeouts to handle Neon serverless pooler scale-to-zero
+const dbUrl = process.env.DATABASE_URL || '';
+const prisma = new PrismaClient(dbUrl ? {
+    datasources: {
+        db: {
+            url: dbUrl.includes('connect_timeout=')
+                ? dbUrl
+                : `${dbUrl}${dbUrl.includes('?') ? '&' : '?'}connect_timeout=15&pool_timeout=30`
+        }
+    }
+} : {});
 
 app.use(express.json());
 app.use(cors());
+
+if (!process.env.CLERK_SECRET_KEY) {
+    console.warn(`${ANSI.yellow}⚠ CLERK_SECRET_KEY is missing from environment variables. Protected routes will reject requests.${ANSI.reset}`);
+}
+
+// Mount full @clerk/express middleware when CLERK_PUBLISHABLE_KEY is also configured;
+// otherwise verify Bearer session JWTs directly using verifyToken + CLERK_SECRET_KEY.
+if (process.env.CLERK_PUBLISHABLE_KEY && process.env.CLERK_SECRET_KEY) {
+    app.use(clerkMiddleware());
+}
+
+async function requireUser(req, res) {
+    if (!process.env.CLERK_SECRET_KEY) {
+        res.status(500).json({
+            status: 'error',
+            error: 'Authentication is not configured on this server (CLERK_SECRET_KEY missing)'
+        });
+        return null;
+    }
+
+    if (process.env.CLERK_PUBLISHABLE_KEY) {
+        const { userId } = getAuth(req);
+        if (!userId) {
+            res.status(401).json({ status: 'error', error: 'Unauthorized' });
+            return null;
+        }
+        return userId;
+    }
+
+    const authHeader = req.headers.authorization || '';
+    const match = authHeader.match(/^Bearer\s+(.+)$/i);
+    if (!match) {
+        res.status(401).json({ status: 'error', error: 'Unauthorized' });
+        return null;
+    }
+
+    try {
+        const payload = await verifyToken(match[1], {
+            secretKey: process.env.CLERK_SECRET_KEY
+        });
+        if (!payload?.sub) {
+            res.status(401).json({ status: 'error', error: 'Unauthorized' });
+            return null;
+        }
+        return payload.sub;
+    } catch {
+        res.status(401).json({ status: 'error', error: 'Unauthorized' });
+        return null;
+    }
+}
 
 // Set up HTTP Server and Socket.io
 const server = http.createServer(app);
@@ -41,6 +103,9 @@ const ANSI = {
     magenta: "\x1b[35m",
     red: "\x1b[31m"
 };
+
+// Per-deployment debounce timers for status updates (prevents pool exhaustion on burst logs)
+const deploymentStatusDebounce = new Map(); // deploymentId -> { status, rank, timer }
 
 // In-memory log history buffer for new subscribers and REST polling
 const MAX_LOG_HISTORY = 150;
@@ -393,6 +458,8 @@ async function initKafkaConsumer() {
 
                     if (clickhouseClient) {
                         try {
+                            // ClickHouse DateTime64(3,'UTC') requires 'YYYY-MM-DD HH:MM:SS.mmm' — no T, no Z
+                            const chTimestamp = ts.replace('T', ' ').replace(/Z$/, '').slice(0, 23);
                             await clickhouseClient.insert({
                                 table: 'deployment_logs',
                                 values: [{
@@ -403,7 +470,7 @@ async function initKafkaConsumer() {
                                     category,
                                     level,
                                     log: typeof log === 'string' ? log : JSON.stringify(log),
-                                    timestamp: ts,
+                                    timestamp: chTimestamp,
                                     raw_meta: rawMeta
                                 }],
                                 format: 'JSONEachRow'
@@ -413,14 +480,41 @@ async function initKafkaConsumer() {
                         }
                     }
 
-                    // Update Deployment status in Postgres BEFORE broadcasting to Socket.io
+                    // Update Deployment status in Postgres BEFORE broadcasting to Socket.io.
+                    // Terminal stages (READY/FAIL) fire immediately; IN_PROGRESS is debounced per
+                    // deployment to avoid exhausting the Prisma connection pool on burst logs.
                     if (resolvedDeploymentId) {
-                        if (stage === 'ready' || level === 'ready') {
-                            await updateDeploymentStatus(resolvedDeploymentId, resolvedProjectId, 'READY');
-                        } else if (stage === 'error') {
-                            await updateDeploymentStatus(resolvedDeploymentId, resolvedProjectId, 'FAIL');
-                        } else if (['container', 'source', 'environment', 'install', 'build', 'upload'].includes(stage)) {
-                            await updateDeploymentStatus(resolvedDeploymentId, resolvedProjectId, 'IN_PROGRESS');
+                        const isTerminal = (stage === 'ready' || level === 'ready') || (stage === 'error');
+                        const nextStatus = (stage === 'ready' || level === 'ready')
+                            ? 'READY'
+                            : stage === 'error'
+                                ? 'FAIL'
+                                : ['container', 'source', 'environment', 'install', 'build', 'upload'].includes(stage)
+                                    ? 'IN_PROGRESS'
+                                    : null;
+
+                        if (nextStatus) {
+                            if (isTerminal) {
+                                // Cancel any pending debounced IN_PROGRESS call and fire immediately
+                                const pending = deploymentStatusDebounce.get(resolvedDeploymentId);
+                                if (pending) {
+                                    clearTimeout(pending.timer);
+                                    deploymentStatusDebounce.delete(resolvedDeploymentId);
+                                }
+                                await updateDeploymentStatus(resolvedDeploymentId, resolvedProjectId, nextStatus);
+                            } else {
+                                // Debounce IN_PROGRESS: only keep highest-rank pending call per deployment
+                                const pending = deploymentStatusDebounce.get(resolvedDeploymentId);
+                                const nextRank = DEPLOYMENT_STATUS_RANK[nextStatus] || 0;
+                                if (!pending || nextRank > pending.rank) {
+                                    if (pending) clearTimeout(pending.timer);
+                                    const timer = setTimeout(async () => {
+                                        deploymentStatusDebounce.delete(resolvedDeploymentId);
+                                        await updateDeploymentStatus(resolvedDeploymentId, resolvedProjectId, nextStatus);
+                                    }, 300);
+                                    deploymentStatusDebounce.set(resolvedDeploymentId, { status: nextStatus, rank: nextRank, timer });
+                                }
+                            }
                         }
                     }
 
@@ -533,10 +627,14 @@ app.get('/', (req, res) => {
     });
 });
 
-// List all projects with their deployments
+// List authenticated user's projects with their deployments
 app.get('/projects', async (req, res) => {
+    const userId = await requireUser(req, res);
+    if (!userId) return;
+
     try {
         const projects = await prisma.project.findMany({
+            where: { ownerId: userId },
             orderBy: { createdAt: 'desc' },
             include: {
                 Deployment: {
@@ -560,8 +658,11 @@ app.get('/projects', async (req, res) => {
     }
 });
 
-// Retrieve single project by ID
+// Retrieve single project by ID (must be owned by authenticated user)
 app.get('/project/:id', async (req, res) => {
+    const userId = await requireUser(req, res);
+    if (!userId) return;
+
     try {
         const { id } = req.params;
 
@@ -578,6 +679,13 @@ app.get('/project/:id', async (req, res) => {
             return res.status(404).json({
                 status: 'error',
                 message: 'Project not found'
+            });
+        }
+
+        if (project.ownerId !== userId) {
+            return res.status(403).json({
+                status: 'error',
+                message: 'Forbidden: you do not have access to this project'
             });
         }
 
@@ -619,6 +727,9 @@ function normalizeGithubUrl(rawUrl) {
 
 // Create project in Postgres (Neon DB)
 app.post('/project', async (req, res) => {
+    const userId = await requireUser(req, res);
+    if (!userId) return;
+
     try {
         const schema = z.object({
             name: z.string({ required_error: 'Project name is required' }).min(1, 'Project name is required'),
@@ -642,8 +753,9 @@ app.post('/project', async (req, res) => {
             });
         }
 
-        // Enforce single project per GitHub repository across normalized variations
+        // Enforce single project per GitHub repository per user across normalized variations
         const existingProjects = await prisma.project.findMany({
+            where: { ownerId: userId },
             orderBy: { createdAt: 'asc' }
         });
         const duplicate = existingProjects.find((p) => {
@@ -656,20 +768,36 @@ app.post('/project', async (req, res) => {
         if (duplicate) {
             return res.status(409).json({
                 status: 'error',
-                message: `A project ('${duplicate.name}') already exists for this GitHub repository.`,
+                message: `You already have a project ('${duplicate.name}') for this GitHub repository.`,
                 data: { existingProject: duplicate }
             });
         }
 
-        // Generate a unique project subdomain slug
-        const subDomain = generateSlug();
+        // Generate a globally unique project subdomain slug across all users
+        let subDomain = generateSlug();
+        for (let attempt = 0; attempt < 10; attempt++) {
+            const slugTaken = await prisma.project.findFirst({
+                where: { subDomain },
+                select: { id: true }
+            });
+            if (!slugTaken) break;
+            subDomain = generateSlug();
+        }
+        const slugStillTaken = await prisma.project.findFirst({
+            where: { subDomain },
+            select: { id: true }
+        });
+        if (slugStillTaken) {
+            subDomain = `${generateSlug()}-${uuidv4().slice(0, 6)}`;
+        }
 
         // Persist project in PostgreSQL via Neon DB
         const project = await prisma.project.create({
             data: {
                 name,
                 gitURL: canonicalGitURL,
-                subDomain
+                subDomain,
+                ownerId: userId
             }
         });
 
@@ -687,8 +815,11 @@ app.post('/project', async (req, res) => {
     }
 });
 
-// Trigger a deployment for an existing project
+// Trigger a deployment for an existing project (owned by authenticated user)
 app.post('/deploy', async (req, res) => {
+    const userId = await requireUser(req, res);
+    if (!userId) return;
+
     let createdDeploymentId = null;
     let projectSubDomain = '';
     let resolvedProjectUuid = null;
@@ -716,6 +847,13 @@ app.post('/deploy', async (req, res) => {
         if (!project) {
             return res.status(404).json({
                 error: 'Project not found'
+            });
+        }
+
+        if (project.ownerId !== userId) {
+            return res.status(403).json({
+                status: 'error',
+                error: 'Forbidden: you do not have access to this project'
             });
         }
 
@@ -861,8 +999,11 @@ app.post('/deploy', async (req, res) => {
     }
 });
 
-// Retrieve single deployment by ID
+// Retrieve single deployment by ID (must belong to authenticated user's project)
 app.get('/deployment/:id', async (req, res) => {
+    const userId = await requireUser(req, res);
+    if (!userId) return;
+
     try {
         const { id } = req.params;
 
@@ -880,6 +1021,13 @@ app.get('/deployment/:id', async (req, res) => {
             });
         }
 
+        if (!deployment.project || deployment.project.ownerId !== userId) {
+            return res.status(403).json({
+                status: 'error',
+                message: 'Forbidden: you do not have access to this deployment'
+            });
+        }
+
         return res.json({
             status: 'success',
             data: { deployment }
@@ -894,7 +1042,7 @@ app.get('/deployment/:id', async (req, res) => {
     }
 });
 
-// Retrieve log history for a project
+// Retrieve log history for a project (public SSE / in-memory stream by random slug)
 app.get('/project/:slug/logs', (req, res) => {
     const { slug } = req.params;
     const logs = logHistory.get(slug) || [];
@@ -905,11 +1053,37 @@ app.get('/project/:slug/logs', (req, res) => {
     });
 });
 
-// Query deployment logs from ClickHouse data warehouse
+// Query deployment logs from ClickHouse data warehouse (must belong to authenticated user's project)
 app.get('/logs/:id', async (req, res) => {
+    const userId = await requireUser(req, res);
+    if (!userId) return;
+
     try {
         const id = req.params.id;
         const limit = Number(req.query.limit) || 1000;
+
+        const deployment = await prisma.deployment.findUnique({
+            where: { id },
+            include: {
+                project: {
+                    select: { ownerId: true }
+                }
+            }
+        });
+
+        if (!deployment) {
+            return res.status(404).json({
+                status: 'error',
+                message: 'Deployment not found'
+            });
+        }
+
+        if (!deployment.project || deployment.project.ownerId !== userId) {
+            return res.status(403).json({
+                status: 'error',
+                message: 'Forbidden: you do not have access to these logs'
+            });
+        }
 
         if (!clickhouseClient) {
             return res.status(503).json({

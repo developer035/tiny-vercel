@@ -18,17 +18,17 @@ import GithubIcon from '../components/GithubIcon';
 import StatusBadge from '../components/StatusBadge';
 import PreviewFrame from '../components/PreviewFrame';
 import {
-  fetchProject,
-  triggerDeploy,
   isDeploymentActive,
   canTransitionStatus,
 } from '../api';
+import { useApi } from '../hooks/useApi';
 import { subscribeToDeploymentStatus } from '../socket';
 import { getAppUrl } from '../config';
 
 export default function Project() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const api = useApi();
 
   const [project, setProject] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -41,7 +41,7 @@ export default function Project() {
     try {
       if (!isSilent) setLoading(true);
       setError(null);
-      const data = await fetchProject(id);
+      const data = await api.fetchProject(id);
       setProject(data);
     } catch (err) {
       if (!isSilent) setError(err.message || 'Failed to load project');
@@ -68,7 +68,7 @@ export default function Project() {
 
         const hasDep = deps.some((d) => d.id === deploymentId);
         if (!hasDep) {
-          fetchProject(id).then((fresh) => fresh && setProject(fresh)).catch(() => {});
+          api.fetchProject(id).then((fresh) => fresh && setProject(fresh)).catch(() => {});
           return prev;
         }
 
@@ -100,7 +100,7 @@ export default function Project() {
     if (!project) return;
     try {
       setDeploying(true);
-      const res = await triggerDeploy(project.id);
+      const res = await api.triggerDeploy(project.id);
       if (res?.deploymentId) {
         navigate(`/deployment/${res.deploymentId}`);
       } else {

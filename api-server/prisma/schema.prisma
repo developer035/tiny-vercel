@@ -21,10 +21,13 @@ model Project {
   gitURL       String       @map("git_url")
   subDomain    String       @map("subdomain")
   customDomain String?      @map("custom_domain")
+  ownerId      String?      @map("owner_id")
   Deployment   Deployment[]
 
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
+
+  @@index([ownerId])
 }
 
 model Deployment {

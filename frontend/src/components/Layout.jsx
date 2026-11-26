@@ -1,7 +1,7 @@
 import React from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import { Globe, Terminal, ArrowUpRight } from 'lucide-react';
 import GithubIcon from './GithubIcon';
+import ProfileMenu from '../auth/ProfileMenu';
 import { CONFIG } from '../config';
 
 export default function Layout({ children }) {
@@ -58,6 +58,8 @@ export default function Layout({ children }) {
             >
               <GithubIcon className="h-4 w-4" />
             </a>
+
+            <ProfileMenu />
           </div>
         </div>
       </header>

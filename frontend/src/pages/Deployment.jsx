@@ -4,16 +4,16 @@ import { ArrowLeft, Clock, Globe, Shield, Terminal as TerminalIcon, AlertCircle,
 import StatusBadge from '../components/StatusBadge';
 import TerminalViewer from '../components/Terminal/TerminalViewer';
 import {
-  fetchDeployment,
-  fetchDeploymentLogs,
   isDeploymentActive,
   canTransitionStatus,
 } from '../api';
+import { useApi } from '../hooks/useApi';
 import { subscribeToLogs, subscribeToDeploymentStatus } from '../socket';
 import { getAppUrl } from '../config';
 
 export default function Deployment() {
   const { deploymentId } = useParams();
+  const api = useApi();
 
   const [deployment, setDeployment] = useState(null);
   const [logs, setLogs] = useState([]);
@@ -44,12 +44,12 @@ export default function Deployment() {
         setError(null);
 
         // 1. Fetch deployment record
-        const depData = await fetchDeployment(deploymentId);
+        const depData = await api.fetchDeployment(deploymentId);
         if (isCancelled) return;
         setDeployment(depData);
 
         // 2. Fetch historical logs from ClickHouse
-        const clickhouseLogs = await fetchDeploymentLogs(deploymentId);
+        const clickhouseLogs = await api.fetchDeploymentLogs(deploymentId);
         if (isCancelled) return;
         setLogs(clickhouseLogs || []);
 
@@ -114,7 +114,7 @@ export default function Deployment() {
     if (!isDeploymentActive(deployment?.status)) return;
 
     const timer = setInterval(() => {
-      fetchDeployment(deploymentId)
+      api.fetchDeployment(deploymentId)
         .then((updated) => {
           if (updated) setDeployment(updated);
         })

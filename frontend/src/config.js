@@ -3,6 +3,7 @@ export const CONFIG = {
   WS_URL: import.meta.env.VITE_WS_URL || 'http://localhost:9000',
   PROXY_PROTOCOL: import.meta.env.VITE_PROXY_PROTOCOL || 'http',
   PROXY_BASE_DOMAIN: import.meta.env.VITE_PROXY_BASE_DOMAIN || 'localhost:8000',
+  CLERK_PUBLISHABLE_KEY: import.meta.env.VITE_CLERK_PUBLISHABLE_KEY || '',
 };
 
 /**

@@ -4,14 +4,14 @@ import { Plus, FolderGit2, Search, RefreshCw, AlertCircle } from 'lucide-react';
 import ProjectCard from '../components/ProjectCard';
 import Modal from '../components/Modal';
 import {
-  fetchProjects,
-  createProject,
   isDeploymentActive,
   canTransitionStatus,
 } from '../api';
+import { useApi } from '../hooks/useApi';
 import { subscribeToDeploymentStatus } from '../socket';
 
 export default function Home() {
+  const api = useApi();
   const [projects, setProjects] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -30,7 +30,7 @@ export default function Home() {
     try {
       if (!isSilent) setLoading(true);
       setError(null);
-      const data = await fetchProjects();
+      const data = await api.fetchProjects();
       setProjects(data);
     } catch (err) {
       if (!isSilent) setError(err.message || 'Failed to load projects');
@@ -110,7 +110,7 @@ export default function Home() {
 
     try {
       setSubmitting(true);
-      await createProject({ name: name.trim(), gitURL: gitURL.trim() });
+      await api.createProject({ name: name.trim(), gitURL: gitURL.trim() });
       setName('');
       setGitURL('');
       setExistingProject(null);
