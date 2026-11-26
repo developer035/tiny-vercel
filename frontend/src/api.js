@@ -25,7 +25,10 @@ export async function createProject({ name, gitURL }) {
   const data = await res.json();
   if (!res.ok) {
     const errorMsg = data.error?.[0]?.message || data.error || data.message || 'Failed to create project';
-    throw new Error(errorMsg);
+    const err = new Error(errorMsg);
+    err.status = res.status;
+    err.existingProject = data.data?.existingProject || null;
+    throw err;
   }
   return data.data?.project;
 }
@@ -49,6 +52,24 @@ export async function fetchDeployment(id) {
   const data = await res.json();
   return data.data?.deployment || null;
 }
+
+export const isDeploymentActive = (status) =>
+  status === 'QUEUED' || status === 'IN_PROGRESS';
+
+const STATUS_RANK = {
+  NOT_STARTED: 0,
+  QUEUED: 1,
+  IN_PROGRESS: 2,
+  READY: 3,
+  FAIL: 3,
+};
+
+export const canTransitionStatus = (currentStatus, nextStatus) => {
+  if (!nextStatus || !(nextStatus in STATUS_RANK)) return false;
+  if (!currentStatus || !(currentStatus in STATUS_RANK)) return true;
+  if (currentStatus === nextStatus) return false;
+  return STATUS_RANK[nextStatus] > STATUS_RANK[currentStatus];
+};
 
 export async function fetchDeploymentLogs(deploymentId, limit = 1500) {
   const res = await fetch(`${BASE}/logs/${deploymentId}?limit=${limit}`);

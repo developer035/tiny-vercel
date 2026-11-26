@@ -156,15 +156,73 @@ function handleIncomingLog(payload, channel) {
     // 1. Terminal log
     console.log(formatTerminalLog(payload));
 
-    // 2. Broadcast structured payload to Socket.io rooms
+    // 2. Broadcast structured payload to Socket.io canonical room exactly once
     const payloadStr = JSON.stringify(payload);
-    if (channel) {
-        io.to(channel).emit('message', payloadStr);
+    const targetRoom = channel || (payload.project ? `logs:${payload.project}` : null);
+    if (targetRoom) {
+        io.to(targetRoom).emit('message', payloadStr);
     }
-    if (payload.project) {
-        io.to(`logs:${payload.project}`).emit('message', payloadStr);
-        io.to(payload.project).emit('message', payloadStr);
+}
+
+// =========================================================================
+// Deployment Status Lifecycle Tracking
+// =========================================================================
+const DEPLOYMENT_ALLOWED_FROM = {
+    IN_PROGRESS: ['NOT_STARTED', 'QUEUED'],
+    READY: ['NOT_STARTED', 'QUEUED', 'IN_PROGRESS'],
+    FAIL: ['NOT_STARTED', 'QUEUED', 'IN_PROGRESS']
+};
+const DEPLOYMENT_STATUS_RANK = {
+    NOT_STARTED: 0,
+    QUEUED: 1,
+    IN_PROGRESS: 2,
+    READY: 3,
+    FAIL: 3
+};
+const deploymentStatusCache = new Map();
+
+function cacheDeploymentStatus(deploymentId, status) {
+    if (deploymentStatusCache.size > 500) {
+        const oldestKey = deploymentStatusCache.keys().next().value;
+        deploymentStatusCache.delete(oldestKey);
     }
+    deploymentStatusCache.set(deploymentId, status);
+}
+
+async function updateDeploymentStatus(deploymentId, projectSlug, nextStatus, projectId = null) {
+    if (!deploymentId || !DEPLOYMENT_ALLOWED_FROM[nextStatus]) return false;
+
+    const cachedStatus = deploymentStatusCache.get(deploymentId);
+    if (cachedStatus && DEPLOYMENT_STATUS_RANK[cachedStatus] >= DEPLOYMENT_STATUS_RANK[nextStatus]) {
+        return false;
+    }
+
+    try {
+        const result = await prisma.deployment.updateMany({
+            where: {
+                id: deploymentId,
+                status: { in: DEPLOYMENT_ALLOWED_FROM[nextStatus] }
+            },
+            data: { status: nextStatus }
+        });
+
+        cacheDeploymentStatus(deploymentId, nextStatus);
+
+        if (result.count > 0) {
+            console.log(`${ANSI.cyan}[DB]${ANSI.reset} Deployment ${deploymentId.slice(0, 8)} status -> ${nextStatus}`);
+            io.emit('deployment:status', {
+                deploymentId,
+                project: projectSlug || '',
+                projectId: projectId || null,
+                status: nextStatus,
+                timestamp: new Date().toISOString()
+            });
+            return true;
+        }
+    } catch (err) {
+        console.error(`${ANSI.red}✖ Failed to update deployment status (${deploymentId} -> ${nextStatus}):${ANSI.reset}`, err.message);
+    }
+    return false;
 }
 
 // =========================================================================
@@ -331,12 +389,14 @@ async function initKafkaConsumer() {
                     const ts = timestamp || new Date().toISOString();
                     const rawMeta = Object.keys(rest).length ? JSON.stringify(rest) : '{}';
 
+                    const logEventId = uuidv4();
+
                     if (clickhouseClient) {
                         try {
                             await clickhouseClient.insert({
                                 table: 'deployment_logs',
                                 values: [{
-                                    event_id: uuidv4(),
+                                    event_id: logEventId,
                                     deployment_id: resolvedDeploymentId,
                                     project_id: resolvedProjectId,
                                     stage,
@@ -353,8 +413,20 @@ async function initKafkaConsumer() {
                         }
                     }
 
+                    // Update Deployment status in Postgres BEFORE broadcasting to Socket.io
+                    if (resolvedDeploymentId) {
+                        if (stage === 'ready' || level === 'ready') {
+                            await updateDeploymentStatus(resolvedDeploymentId, resolvedProjectId, 'READY');
+                        } else if (stage === 'error') {
+                            await updateDeploymentStatus(resolvedDeploymentId, resolvedProjectId, 'FAIL');
+                        } else if (['container', 'source', 'environment', 'install', 'build', 'upload'].includes(stage)) {
+                            await updateDeploymentStatus(resolvedDeploymentId, resolvedProjectId, 'IN_PROGRESS');
+                        }
+                    }
+
                     // Forward real-time log to console and Socket.io clients (replacing Redis pub/sub)
                     const logPayload = {
+                        event_id: logEventId,
                         project: resolvedProjectId,
                         deployment_id: resolvedDeploymentId,
                         stage,
@@ -382,6 +454,7 @@ async function initKafkaConsumer() {
  */
 function publishApiLog(project, log, { stage = "provisioning", category = "container", level = "info", meta = {} } = {}) {
     const payload = {
+        event_id: uuidv4(),
         project,
         log,
         stage,
@@ -401,11 +474,10 @@ io.on('connection', (socket) => {
     // Client requests to subscribe to logs for a specific project
     socket.on('subscribe', (channelOrSlug) => {
         const projectSlug = channelOrSlug.replace('logs:', '');
-        socket.join(channelOrSlug);
-        socket.join(projectSlug);
-        socket.join(`logs:${projectSlug}`);
+        const canonicalRoom = `logs:${projectSlug}`;
+        socket.join(canonicalRoom);
 
-        console.log(`${ANSI.gray}[WS]${ANSI.reset} Socket ${socket.id} subscribed to: ${channelOrSlug}`);
+        console.log(`${ANSI.gray}[WS]${ANSI.reset} Socket ${socket.id} subscribed to: ${canonicalRoom}`);
 
         // Replay historical logs if available so initial provisioning logs are never lost
         const history = logHistory.get(projectSlug);
@@ -415,6 +487,7 @@ io.on('connection', (socket) => {
             }
         } else {
             socket.emit('message', JSON.stringify({
+                event_id: uuidv4(),
                 project: projectSlug,
                 log: `Connected to log stream for ${projectSlug}`,
                 level: 'info',
@@ -423,6 +496,14 @@ io.on('connection', (socket) => {
                 timestamp: new Date().toISOString()
             }));
         }
+    });
+
+    // Client unsubscribes when leaving deployment page
+    socket.on('unsubscribe', (channelOrSlug) => {
+        const projectSlug = channelOrSlug.replace('logs:', '');
+        const canonicalRoom = `logs:${projectSlug}`;
+        socket.leave(canonicalRoom);
+        console.log(`${ANSI.gray}[WS]${ANSI.reset} Socket ${socket.id} unsubscribed from: ${canonicalRoom}`);
     });
 
     socket.on('disconnect', () => {
@@ -514,6 +595,28 @@ app.get('/project/:id', async (req, res) => {
     }
 });
 
+function normalizeGithubUrl(rawUrl) {
+    try {
+        const parsed = new URL(String(rawUrl).trim());
+        const host = parsed.hostname.toLowerCase();
+        if (host !== 'github.com' && host !== 'www.github.com') {
+            return null;
+        }
+        const segments = parsed.pathname.split('/').filter(Boolean);
+        if (segments.length < 2) {
+            return null;
+        }
+        const owner = segments[0].toLowerCase();
+        const repo = segments[1].replace(/\.git$/i, '').toLowerCase();
+        if (!owner || !repo) {
+            return null;
+        }
+        return `https://github.com/${owner}/${repo}`;
+    } catch {
+        return null;
+    }
+}
+
 // Create project in Postgres (Neon DB)
 app.post('/project', async (req, res) => {
     try {
@@ -532,22 +635,29 @@ app.post('/project', async (req, res) => {
 
         const { name, gitURL } = safeParseResult.data;
 
-        // Basic GitHub repository URL validation
-        let repositoryURL;
-        try {
-            repositoryURL = new URL(gitURL);
-        } catch {
+        const canonicalGitURL = normalizeGithubUrl(gitURL);
+        if (!canonicalGitURL) {
             return res.status(400).json({
-                error: 'Invalid repository URL'
+                error: 'Please provide a valid GitHub repository URL (e.g. https://github.com/owner/repo)'
             });
         }
 
-        if (
-            repositoryURL.hostname !== 'github.com' ||
-            !repositoryURL.pathname.split('/').filter(Boolean).length
-        ) {
-            return res.status(400).json({
-                error: 'Please provide a valid GitHub repository URL'
+        // Enforce single project per GitHub repository across normalized variations
+        const existingProjects = await prisma.project.findMany({
+            orderBy: { createdAt: 'asc' }
+        });
+        const duplicate = existingProjects.find((p) => {
+            const normalizedExisting = normalizeGithubUrl(p.gitURL);
+            return normalizedExisting
+                ? normalizedExisting === canonicalGitURL
+                : p.gitURL.trim().toLowerCase() === canonicalGitURL;
+        });
+
+        if (duplicate) {
+            return res.status(409).json({
+                status: 'error',
+                message: `A project ('${duplicate.name}') already exists for this GitHub repository.`,
+                data: { existingProject: duplicate }
             });
         }
 
@@ -558,7 +668,7 @@ app.post('/project', async (req, res) => {
         const project = await prisma.project.create({
             data: {
                 name,
-                gitURL,
+                gitURL: canonicalGitURL,
                 subDomain
             }
         });
@@ -579,6 +689,10 @@ app.post('/project', async (req, res) => {
 
 // Trigger a deployment for an existing project
 app.post('/deploy', async (req, res) => {
+    let createdDeploymentId = null;
+    let projectSubDomain = '';
+    let resolvedProjectUuid = null;
+
     try {
         const schema = z.object({
             projectId: z.string({ required_error: 'projectId is required' }).min(1, 'projectId cannot be empty')
@@ -605,6 +719,9 @@ app.post('/deploy', async (req, res) => {
             });
         }
 
+        projectSubDomain = project.subDomain;
+        resolvedProjectUuid = project.id;
+
         // Create deployment record with QUEUED status
         const deployment = await prisma.deployment.create({
             data: {
@@ -612,6 +729,8 @@ app.post('/deploy', async (req, res) => {
                 status: 'QUEUED'
             }
         });
+        createdDeploymentId = deployment.id;
+        cacheDeploymentStatus(deployment.id, 'QUEUED');
 
         // Cloud Run Job resource name
         const jobName =
@@ -691,6 +810,24 @@ app.post('/deploy', async (req, res) => {
             }
         });
 
+        // Monitor Cloud Run Job LRO in the background as a fallback if Kafka misses final status
+        if (operation && typeof operation.promise === 'function') {
+            operation.promise()
+                .then(async ([execution]) => {
+                    const failedCount = execution?.failedCount || 0;
+                    const succeededCount = execution?.succeededCount || 0;
+                    if (failedCount > 0) {
+                        await updateDeploymentStatus(deployment.id, project.subDomain, 'FAIL', project.id);
+                    } else if (succeededCount > 0) {
+                        await updateDeploymentStatus(deployment.id, project.subDomain, 'READY', project.id);
+                    }
+                })
+                .catch(async (execErr) => {
+                    console.error(`${ANSI.red}✖ Cloud Run Job execution error (${deployment.id}):${ANSI.reset}`, execErr?.message || execErr);
+                    await updateDeploymentStatus(deployment.id, project.subDomain, 'FAIL', project.id);
+                });
+        }
+
         // 2. Log successful dispatch
         publishApiLog(project.subDomain, `Cloud Run Job container dispatched. Waiting for build worker to boot...`, {
             stage: 'provisioning',
@@ -711,6 +848,10 @@ app.post('/deploy', async (req, res) => {
 
     } catch (error) {
         console.error(`${ANSI.red}✖ Deployment error:${ANSI.reset}`, error);
+
+        if (createdDeploymentId) {
+            await updateDeploymentStatus(createdDeploymentId, projectSubDomain, 'FAIL', resolvedProjectUuid);
+        }
 
         return res.status(500).json({
             status: 'error',

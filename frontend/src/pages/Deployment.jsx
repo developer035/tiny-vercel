@@ -3,8 +3,13 @@ import { useParams, Link } from 'react-router-dom';
 import { ArrowLeft, Clock, Globe, Shield, Terminal as TerminalIcon, AlertCircle, RefreshCw } from 'lucide-react';
 import StatusBadge from '../components/StatusBadge';
 import TerminalViewer from '../components/Terminal/TerminalViewer';
-import { fetchDeployment, fetchDeploymentLogs } from '../api';
-import { subscribeToLogs } from '../socket';
+import {
+  fetchDeployment,
+  fetchDeploymentLogs,
+  isDeploymentActive,
+  canTransitionStatus,
+} from '../api';
+import { subscribeToLogs, subscribeToDeploymentStatus } from '../socket';
 import { getAppUrl } from '../config';
 
 export default function Deployment() {
@@ -16,7 +21,22 @@ export default function Deployment() {
   const [error, setError] = useState(null);
 
   useEffect(() => {
+    let isCancelled = false;
     let unsubscribeSocket = null;
+    let unsubscribeStatus = null;
+
+    const getLogKey = (item) => {
+      if (!item) return '';
+      if (item.event_id) return item.event_id;
+      return `${item.timestamp || ''}|${item.stage || ''}|${item.level || ''}|${item.log || ''}`;
+    };
+
+    const applyStatusTransition = (nextStatus) => {
+      setDeployment((prev) => {
+        if (!prev || !canTransitionStatus(prev.status, nextStatus)) return prev;
+        return { ...prev, status: nextStatus };
+      });
+    };
 
     const loadDeploymentAndLogs = async () => {
       try {
@@ -25,43 +45,84 @@ export default function Deployment() {
 
         // 1. Fetch deployment record
         const depData = await fetchDeployment(deploymentId);
+        if (isCancelled) return;
         setDeployment(depData);
 
         // 2. Fetch historical logs from ClickHouse
         const clickhouseLogs = await fetchDeploymentLogs(deploymentId);
-        setLogs(clickhouseLogs);
+        if (isCancelled) return;
+        setLogs(clickhouseLogs || []);
 
-        // 3. Connect real-time WebSocket subscriber if project subdomain is available
+        // 3. Listen for real-time backend status transitions for this deployment
+        unsubscribeStatus = subscribeToDeploymentStatus(({ deploymentId: evtDepId, status }) => {
+          if (isCancelled || evtDepId !== deploymentId) return;
+          applyStatusTransition(status);
+        });
+
+        // 4. Connect real-time WebSocket subscriber if project subdomain is available
         const projectSlug = depData?.project?.subDomain;
-        if (projectSlug) {
+        if (projectSlug && !isCancelled) {
           unsubscribeSocket = subscribeToLogs(projectSlug, (incomingLog) => {
+            if (isCancelled) return;
+            // Ignore Kafka logs belonging to a different deployment of the same project
+            if (incomingLog.deployment_id && incomingLog.deployment_id !== deploymentId) {
+              return;
+            }
+
             // Deduplicate incoming log lines
             setLogs((prev) => {
-              const incomingId = incomingLog.event_id || `${incomingLog.timestamp}-${incomingLog.log}`;
-              const exists = prev.some((l) => (l.event_id && l.event_id === incomingId));
+              const incomingKey = getLogKey(incomingLog);
+              const exists = prev.some((l) => getLogKey(l) === incomingKey);
               if (exists) return prev;
               return [...prev, incomingLog];
             });
 
-            // If log indicates success or failure, refresh deployment status
+            // Sync UI status when active or terminal log stages arrive
             if (incomingLog.level === 'ready' || incomingLog.stage === 'ready') {
-              fetchDeployment(deploymentId).then(setDeployment).catch(() => {});
+              applyStatusTransition('READY');
+            } else if (incomingLog.stage === 'error') {
+              applyStatusTransition('FAIL');
+            } else if (
+              ['container', 'source', 'environment', 'install', 'build', 'upload'].includes(incomingLog.stage)
+            ) {
+              applyStatusTransition('IN_PROGRESS');
             }
           });
         }
       } catch (err) {
-        setError(err.message || 'Failed to load deployment');
+        if (!isCancelled) {
+          setError(err.message || 'Failed to load deployment');
+        }
       } finally {
-        setLoading(false);
+        if (!isCancelled) {
+          setLoading(false);
+        }
       }
     };
 
     loadDeploymentAndLogs();
 
     return () => {
+      isCancelled = true;
       if (unsubscribeSocket) unsubscribeSocket();
+      if (unsubscribeStatus) unsubscribeStatus();
     };
   }, [deploymentId]);
+
+  // Lightweight polling fallback while deployment is active in case a WebSocket frame was missed
+  useEffect(() => {
+    if (!isDeploymentActive(deployment?.status)) return;
+
+    const timer = setInterval(() => {
+      fetchDeployment(deploymentId)
+        .then((updated) => {
+          if (updated) setDeployment(updated);
+        })
+        .catch(() => {});
+    }, 4000);
+
+    return () => clearInterval(timer);
+  }, [deploymentId, deployment?.status]);
 
   if (loading && !deployment) {
     return (
@@ -87,7 +148,7 @@ export default function Deployment() {
   }
 
   const project = deployment.project;
-  const isLive = deployment.status === 'QUEUED' || deployment.status === 'IN_PROGRESS';
+  const isLive = isDeploymentActive(deployment.status);
   const appUrl = getAppUrl(project?.subDomain);
 
   return (

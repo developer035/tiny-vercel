@@ -1,8 +1,15 @@
 import React, { useState, useEffect } from 'react';
+import { Link } from 'react-router-dom';
 import { Plus, FolderGit2, Search, RefreshCw, AlertCircle } from 'lucide-react';
 import ProjectCard from '../components/ProjectCard';
 import Modal from '../components/Modal';
-import { fetchProjects, createProject } from '../api';
+import {
+  fetchProjects,
+  createProject,
+  isDeploymentActive,
+  canTransitionStatus,
+} from '../api';
+import { subscribeToDeploymentStatus } from '../socket';
 
 export default function Home() {
   const [projects, setProjects] = useState([]);
@@ -16,17 +23,19 @@ export default function Home() {
   const [gitURL, setGitURL] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState('');
+  const [existingProject, setExistingProject] = useState(null);
 
-  const loadProjects = async () => {
+  const loadProjects = async (silent = false) => {
+    const isSilent = silent === true;
     try {
-      setLoading(true);
+      if (!isSilent) setLoading(true);
       setError(null);
       const data = await fetchProjects();
       setProjects(data);
     } catch (err) {
-      setError(err.message || 'Failed to load projects');
+      if (!isSilent) setError(err.message || 'Failed to load projects');
     } finally {
-      setLoading(false);
+      if (!isSilent) setLoading(false);
     }
   };
 
@@ -34,9 +43,61 @@ export default function Home() {
     loadProjects();
   }, []);
 
+  // Real-time deployment status updates across all project cards
+  useEffect(() => {
+    const unsubscribe = subscribeToDeploymentStatus(({ deploymentId, project: slug, projectId, status }) => {
+      setProjects((prev) =>
+        prev.map((proj) => {
+          const deps = proj.Deployment || [];
+          const matches =
+            (projectId && proj.id === projectId) ||
+            (slug && proj.subDomain === slug) ||
+            deps.some((d) => d.id === deploymentId);
+          if (!matches) return proj;
+
+          const exists = deps.some((d) => d.id === deploymentId);
+          if (exists) {
+            return {
+              ...proj,
+              Deployment: deps.map((d) =>
+                d.id === deploymentId && canTransitionStatus(d.status, status)
+                  ? { ...d, status }
+                  : d
+              ),
+            };
+          }
+
+          return {
+            ...proj,
+            Deployment: [{ id: deploymentId, status, createdAt: new Date().toISOString() }, ...deps],
+          };
+        })
+      );
+    });
+
+    return unsubscribe;
+  }, []);
+
+  // Conditional polling while any project's latest deployment is still queued or building
+  const hasActiveDeployments = projects.some((p) => isDeploymentActive(p.Deployment?.[0]?.status));
+  useEffect(() => {
+    if (!hasActiveDeployments) return;
+    const timer = setInterval(() => {
+      loadProjects(true);
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [hasActiveDeployments]);
+
+  const handleCloseModal = () => {
+    setIsModalOpen(false);
+    setFormError('');
+    setExistingProject(null);
+  };
+
   const handleCreateProject = async (e) => {
     e.preventDefault();
     setFormError('');
+    setExistingProject(null);
 
     if (!name.trim()) {
       setFormError('Project name is required');
@@ -52,10 +113,14 @@ export default function Home() {
       await createProject({ name: name.trim(), gitURL: gitURL.trim() });
       setName('');
       setGitURL('');
+      setExistingProject(null);
       setIsModalOpen(false);
       await loadProjects();
     } catch (err) {
       setFormError(err.message || 'Failed to create project');
+      if (err.existingProject) {
+        setExistingProject(err.existingProject);
+      }
     } finally {
       setSubmitting(false);
     }
@@ -156,13 +221,22 @@ export default function Home() {
       {/* New Project Modal */}
       <Modal
         isOpen={isModalOpen}
-        onClose={() => setIsModalOpen(false)}
+        onClose={handleCloseModal}
         title="Deploy New Project"
       >
         <form onSubmit={handleCreateProject} className="space-y-4">
           {formError && (
-            <div className="rounded-md border border-rose-900/50 bg-rose-950/30 p-2.5 text-xs text-rose-400">
-              {formError}
+            <div className="rounded-md border border-rose-900/50 bg-rose-950/30 p-2.5 text-xs text-rose-400 space-y-1.5">
+              <p>{formError}</p>
+              {existingProject && (
+                <Link
+                  to={`/project/${existingProject.id}`}
+                  onClick={handleCloseModal}
+                  className="inline-flex items-center gap-1 text-emerald-400 hover:text-emerald-300 font-medium underline underline-offset-2"
+                >
+                  Open existing project &ldquo;{existingProject.name}&rdquo; &rarr;
+                </Link>
+              )}
             </div>
           )}
 
@@ -198,7 +272,7 @@ export default function Home() {
           <div className="flex justify-end gap-2 pt-2">
             <button
               type="button"
-              onClick={() => setIsModalOpen(false)}
+              onClick={handleCloseModal}
               className="rounded-md border border-zinc-800 px-3 py-1.5 text-xs text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 transition-colors"
             >
               Cancel

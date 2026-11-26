@@ -31,6 +31,8 @@ export function subscribeToLogs(projectSlug, onMessage) {
   const handleMessage = (rawMessage) => {
     try {
       const payload = typeof rawMessage === 'string' ? JSON.parse(rawMessage) : rawMessage;
+      // Discard messages meant for another project if on a shared socket
+      if (payload.project && payload.project !== projectSlug) return;
       onMessage(payload);
     } catch {
       onMessage({ log: String(rawMessage), level: 'info', stage: 'build' });
@@ -41,5 +43,27 @@ export function subscribeToLogs(projectSlug, onMessage) {
 
   return () => {
     s.off('message', handleMessage);
+    s.emit('unsubscribe', channel);
+  };
+}
+
+export function subscribeToDeploymentStatus(onStatusChange) {
+  const s = getSocket();
+
+  const handleStatus = (rawPayload) => {
+    try {
+      const payload = typeof rawPayload === 'string' ? JSON.parse(rawPayload) : rawPayload;
+      if (payload && payload.status) {
+        onStatusChange(payload);
+      }
+    } catch {
+      // ignore malformed payloads
+    }
+  };
+
+  s.on('deployment:status', handleStatus);
+
+  return () => {
+    s.off('deployment:status', handleStatus);
   };
 }

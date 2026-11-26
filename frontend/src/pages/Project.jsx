@@ -17,7 +17,13 @@ import {
 import GithubIcon from '../components/GithubIcon';
 import StatusBadge from '../components/StatusBadge';
 import PreviewFrame from '../components/PreviewFrame';
-import { fetchProject, triggerDeploy } from '../api';
+import {
+  fetchProject,
+  triggerDeploy,
+  isDeploymentActive,
+  canTransitionStatus,
+} from '../api';
+import { subscribeToDeploymentStatus } from '../socket';
 import { getAppUrl } from '../config';
 
 export default function Project() {
@@ -30,22 +36,65 @@ export default function Project() {
   const [deploying, setDeploying] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  const loadData = async () => {
+  const loadData = async (silent = false) => {
+    const isSilent = silent === true;
     try {
-      setLoading(true);
+      if (!isSilent) setLoading(true);
       setError(null);
       const data = await fetchProject(id);
       setProject(data);
     } catch (err) {
-      setError(err.message || 'Failed to load project');
+      if (!isSilent) setError(err.message || 'Failed to load project');
     } finally {
-      setLoading(false);
+      if (!isSilent) setLoading(false);
     }
   };
 
   useEffect(() => {
     loadData();
   }, [id]);
+
+  // Real-time status updates via Socket.io
+  useEffect(() => {
+    const unsubscribe = subscribeToDeploymentStatus(({ deploymentId, project: slug, projectId, status }) => {
+      setProject((prev) => {
+        if (!prev) return prev;
+        const deps = prev.Deployment || [];
+        const matchesProject =
+          (projectId && prev.id === projectId) ||
+          (slug && prev.subDomain === slug) ||
+          deps.some((d) => d.id === deploymentId);
+        if (!matchesProject) return prev;
+
+        const hasDep = deps.some((d) => d.id === deploymentId);
+        if (!hasDep) {
+          fetchProject(id).then((fresh) => fresh && setProject(fresh)).catch(() => {});
+          return prev;
+        }
+
+        return {
+          ...prev,
+          Deployment: deps.map((d) =>
+            d.id === deploymentId && canTransitionStatus(d.status, status)
+              ? { ...d, status }
+              : d
+          ),
+        };
+      });
+    });
+
+    return unsubscribe;
+  }, [id]);
+
+  // Conditional polling while any deployment for this project is still queued or building
+  const hasActiveDeployment = (project?.Deployment || []).some((d) => isDeploymentActive(d.status));
+  useEffect(() => {
+    if (!hasActiveDeployment) return;
+    const timer = setInterval(() => {
+      loadData(true);
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [id, hasActiveDeployment]);
 
   const handleDeploy = async () => {
     if (!project) return;
