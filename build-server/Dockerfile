@@ -28,7 +28,11 @@ WORKDIR /home/app
 COPY package*.json ./
 RUN npm ci
 
-COPY main.sh script.js ./
+COPY main.sh script.js kafka.pem* kafca_ca.pem* Kafka*.pem* ./
+
+# Dynamic Kafka CA certificate configuration (can receive PEM contents directly)
+ENV KAFKA_CA_CERT=""
+ENV KAFKA_CA_PATH="/home/app/kafka.pem"
 
 # Normalize Windows CRLF line endings
 RUN sed -i 's/\r$//' /home/app/main.sh && \
