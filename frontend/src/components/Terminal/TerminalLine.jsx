@@ -1,5 +1,6 @@
 import React from 'react';
 import AnsiText from './AnsiText';
+import { isWarningLog, parseLogTimestamp } from '../../utils/deploymentPhases';
 
 const STAGE_STYLES = {
   provisioning: { label: '[PROVISION]', cls: 'text-fuchsia-400 bg-fuchsia-950/40 border-fuchsia-800/40' },
@@ -29,9 +30,8 @@ const LEVEL_STYLES = {
 export default function TerminalLine({ logEntry }) {
   const { timestamp, stage, level, log } = logEntry;
 
-  const timeStr = timestamp
-    ? new Date(timestamp).toLocaleTimeString('en-GB')
-    : new Date().toLocaleTimeString('en-GB');
+  const parsedMs = parseLogTimestamp(timestamp);
+  const timeStr = (parsedMs !== null ? new Date(parsedMs) : new Date()).toLocaleTimeString('en-GB');
 
   const normalizedStage = (stage || 'build').toLowerCase();
   const stageInfo = STAGE_STYLES[normalizedStage] || {
@@ -40,7 +40,10 @@ export default function TerminalLine({ logEntry }) {
   };
 
   const normalizedLevel = (level || 'info').toLowerCase();
-  const levelInfo = LEVEL_STYLES[normalizedLevel] || LEVEL_STYLES.info;
+  const isNpmWarning = normalizedLevel !== 'error' && normalizedStage !== 'error' && isWarningLog(logEntry);
+  const levelInfo = isNpmWarning
+    ? LEVEL_STYLES.warn
+    : LEVEL_STYLES[normalizedLevel] || LEVEL_STYLES.info;
 
   return (
     <div className="flex items-start gap-2 py-0.5 px-2 hover:bg-zinc-900/60 transition-colors font-mono text-[12px] leading-relaxed group">

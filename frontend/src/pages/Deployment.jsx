@@ -219,6 +219,7 @@ export default function Deployment() {
           logs={logs}
           isLive={isLive}
           deploymentId={deployment.id}
+          deploymentStatus={deployment.status}
         />
       </section>
     </div>

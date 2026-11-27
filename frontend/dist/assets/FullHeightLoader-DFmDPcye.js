@@ -1,1 +1,0 @@
-import{d as e}from"./makeCustomizable-DA-lXxCL.js";import{S as o,F as s}from"./index-DEDa0oTA.js";import{j as r}from"./index-BlhMn5Fi.js";const n=()=>r(s,{center:!0,sx:{height:"100%"},children:r(o,{colorScheme:"primary",size:"lg",elementDescriptor:e.spinner})});export{n as F};
