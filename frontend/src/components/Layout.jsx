@@ -70,10 +70,22 @@ export default function Layout({ children }) {
       </main>
 
       {/* Minimal Footer */}
-      <footer className="border-t border-zinc-900 py-6 text-center text-xs text-zinc-600">
-        <div className="mx-auto max-w-7xl px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
-          <span>Tiny Vercel • Automated Containerized Cloud Deployment Engine</span>
-          <span className="font-mono text-[11px]">
+      <footer className="border-t border-zinc-900 py-6 text-xs text-zinc-500">
+        <div className="mx-auto max-w-7xl px-4 flex flex-col sm:flex-row items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center justify-center sm:justify-start gap-2 sm:gap-4">
+            <span className="text-zinc-400">Tiny Vercel • Automated Cloud Deployment Engine</span>
+            <span className="hidden sm:inline text-zinc-700">•</span>
+            <div className="flex items-center gap-3">
+              <Link to="/privacy" className="text-zinc-400 hover:text-zinc-200 transition-colors">
+                Privacy Policy
+              </Link>
+              <span className="text-zinc-700">•</span>
+              <Link to="/terms" className="text-zinc-400 hover:text-zinc-200 transition-colors">
+                Terms of Service
+              </Link>
+            </div>
+          </div>
+          <span className="font-mono text-[11px] text-zinc-500">
             Proxy: {CONFIG.PROXY_PROTOCOL}://*.{CONFIG.PROXY_BASE_DOMAIN}
           </span>
         </div>

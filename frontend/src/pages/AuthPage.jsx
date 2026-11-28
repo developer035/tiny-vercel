@@ -53,6 +53,18 @@ export default function AuthPage({ mode = 'sign-in' }) {
           appearance={clerkAppearance}
         />
       )}
+
+      <p className="mt-4 text-center text-[11px] text-zinc-500">
+        By continuing, you agree to Tiny Vercel's{' '}
+        <Link to="/terms" className="text-zinc-400 underline underline-offset-2 hover:text-zinc-200">
+          Terms of Service
+        </Link>{' '}
+        and{' '}
+        <Link to="/privacy" className="text-zinc-400 underline underline-offset-2 hover:text-zinc-200">
+          Privacy Policy
+        </Link>
+        .
+      </p>
     </div>
   );
 }
