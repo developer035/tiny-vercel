@@ -50,19 +50,30 @@ export function createApiClient(getToken) {
       return data?.data?.project || null;
     },
 
-    async createProject({ name, gitURL }) {
+    async createProject({ name, gitURL, subDomain }) {
       const res = await authFetch('/project', {
         method: 'POST',
-        body: JSON.stringify({ name, gitURL }),
+        body: JSON.stringify({ name, gitURL, subDomain }),
       });
       const data = await parseJsonSafe(res);
       if (!res.ok) {
-        const err = new Error(extractErrorMessage(data, 'Failed to create project'));
+        const errorMsg = extractErrorMessage(data, 'Failed to create project');
+        const err = new Error(errorMsg);
         err.status = res.status;
+        err.field = data?.field || null;
         err.existingProject = data?.data?.existingProject || null;
         throw err;
       }
       return data?.data?.project;
+    },
+
+    async generateSubdomain() {
+      const res = await authFetch('/slug/generate');
+      const data = await parseJsonSafe(res);
+      if (!res.ok) {
+        throw new Error(extractErrorMessage(data, 'Failed to generate subdomain'));
+      }
+      return data?.data?.subDomain || '';
     },
 
     async triggerDeploy(projectId) {
@@ -108,6 +119,9 @@ export const fetchProject = (id, getToken) =>
 
 export const createProject = (payload, getToken) =>
   (getToken ? createApiClient(getToken) : defaultClient).createProject(payload);
+
+export const generateSubdomain = (getToken) =>
+  (getToken ? createApiClient(getToken) : defaultClient).generateSubdomain();
 
 export const triggerDeploy = (projectId, getToken) =>
   (getToken ? createApiClient(getToken) : defaultClient).triggerDeploy(projectId);

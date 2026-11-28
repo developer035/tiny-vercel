@@ -725,6 +725,41 @@ function normalizeGithubUrl(rawUrl) {
     }
 }
 
+function normalizeSubDomain(raw) {
+    if (!raw || typeof raw !== 'string') return '';
+    return raw.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '');
+}
+
+async function generateUniqueSubDomain() {
+    for (let attempt = 0; attempt < 10; attempt++) {
+        const candidate = generateSlug();
+        const exists = await prisma.project.findFirst({
+            where: { subDomain: candidate },
+            select: { id: true }
+        });
+        if (!exists) return candidate;
+    }
+    return `${generateSlug()}-${uuidv4().slice(0, 6)}`;
+}
+
+// Generate a globally unique project subdomain slug
+app.get('/slug/generate', async (req, res) => {
+    try {
+        const subDomain = await generateUniqueSubDomain();
+        return res.json({
+            status: 'success',
+            data: { subDomain }
+        });
+    } catch (error) {
+        console.error(`${ANSI.red}✖ Error generating subdomain slug:${ANSI.reset}`, error);
+        return res.status(500).json({
+            status: 'error',
+            message: 'Failed to generate unique subdomain',
+            error: error.message
+        });
+    }
+});
+
 // Create project in Postgres (Neon DB)
 app.post('/project', async (req, res) => {
     const userId = await requireUser(req, res);
@@ -732,8 +767,9 @@ app.post('/project', async (req, res) => {
 
     try {
         const schema = z.object({
-            name: z.string({ required_error: 'Project name is required' }).min(1, 'Project name is required'),
-            gitURL: z.string({ required_error: 'GitHub repository URL is required' }).url('Invalid repository URL')
+            name: z.string({ required_error: 'Project name is required' }).trim().min(1, 'Project name is required'),
+            gitURL: z.string({ required_error: 'GitHub repository URL is required' }).url('Invalid repository URL'),
+            subDomain: z.string().optional()
         });
 
         const safeParseResult = schema.safeParse(req.body);
@@ -744,7 +780,7 @@ app.post('/project', async (req, res) => {
             });
         }
 
-        const { name, gitURL } = safeParseResult.data;
+        const { name, gitURL, subDomain: providedSubDomain } = safeParseResult.data;
 
         const canonicalGitURL = normalizeGithubUrl(gitURL);
         if (!canonicalGitURL) {
@@ -753,50 +789,77 @@ app.post('/project', async (req, res) => {
             });
         }
 
-        // Enforce single project per GitHub repository per user across normalized variations
-        const existingProjects = await prisma.project.findMany({
+        // Fetch user's existing projects to verify per-user uniqueness
+        const userProjects = await prisma.project.findMany({
             where: { ownerId: userId },
             orderBy: { createdAt: 'asc' }
         });
-        const duplicate = existingProjects.find((p) => {
+
+        // 1. Enforce unique project name per user (case-insensitive)
+        const duplicateName = userProjects.find(
+            (p) => p.name.trim().toLowerCase() === name.trim().toLowerCase()
+        );
+        if (duplicateName) {
+            return res.status(409).json({
+                status: 'error',
+                field: 'name',
+                message: `You already have a project named '${duplicateName.name}'. Please choose a different project name.`,
+                data: { existingProject: duplicateName }
+            });
+        }
+
+        // 2. Enforce single project per GitHub repository per user across normalized variations
+        const duplicateRepo = userProjects.find((p) => {
             const normalizedExisting = normalizeGithubUrl(p.gitURL);
             return normalizedExisting
                 ? normalizedExisting === canonicalGitURL
                 : p.gitURL.trim().toLowerCase() === canonicalGitURL;
         });
 
-        if (duplicate) {
+        if (duplicateRepo) {
             return res.status(409).json({
                 status: 'error',
-                message: `You already have a project ('${duplicate.name}') for this GitHub repository.`,
-                data: { existingProject: duplicate }
+                field: 'gitURL',
+                message: `You already have a project ('${duplicateRepo.name}') for this GitHub repository.`,
+                data: { existingProject: duplicateRepo }
             });
         }
 
-        // Generate a globally unique project subdomain slug across all users
-        let subDomain = generateSlug();
-        for (let attempt = 0; attempt < 10; attempt++) {
-            const slugTaken = await prisma.project.findFirst({
-                where: { subDomain },
+        // 3. Resolve and validate subdomain (globally unique across ALL users' projects)
+        let resolvedSubDomain = '';
+        if (providedSubDomain && typeof providedSubDomain === 'string' && providedSubDomain.trim()) {
+            const canonicalSub = normalizeSubDomain(providedSubDomain);
+            if (!canonicalSub || !/^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])?$/.test(canonicalSub)) {
+                return res.status(400).json({
+                    status: 'error',
+                    field: 'subDomain',
+                    message: 'Subdomain must be 3-63 characters, start and end with a lowercase letter or number, and contain only lowercase letters, numbers, and hyphens.'
+                });
+            }
+
+            // Check global uniqueness across all users
+            const existingSub = await prisma.project.findFirst({
+                where: { subDomain: canonicalSub },
                 select: { id: true }
             });
-            if (!slugTaken) break;
-            subDomain = generateSlug();
-        }
-        const slugStillTaken = await prisma.project.findFirst({
-            where: { subDomain },
-            select: { id: true }
-        });
-        if (slugStillTaken) {
-            subDomain = `${generateSlug()}-${uuidv4().slice(0, 6)}`;
+            if (existingSub) {
+                return res.status(409).json({
+                    status: 'error',
+                    field: 'subDomain',
+                    message: `Subdomain '${canonicalSub}' is already in use by another project. Please regenerate or pick a different subdomain.`
+                });
+            }
+            resolvedSubDomain = canonicalSub;
+        } else {
+            resolvedSubDomain = await generateUniqueSubDomain();
         }
 
         // Persist project in PostgreSQL via Neon DB
         const project = await prisma.project.create({
             data: {
-                name,
+                name: name.trim(),
                 gitURL: canonicalGitURL,
-                subDomain,
+                subDomain: resolvedSubDomain,
                 ownerId: userId
             }
         });
